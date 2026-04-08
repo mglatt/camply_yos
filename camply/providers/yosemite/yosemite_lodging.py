@@ -268,18 +268,39 @@ class YosemiteLodging(BaseProvider):
 
                 initial_resp = initial_resp_info.value
                 logger.debug(
-                    "Initial API call: status=%s url=%s",
+                    "Initial API call: status=%s\n  url=%s",
                     initial_resp.status,
-                    initial_resp.url[:200],
+                    initial_resp.url,
                 )
 
                 if initial_resp.status != 200:
+                    # Log the response body to understand why the request failed
+                    try:
+                        resp_body = initial_resp.text()[:500]
+                    except Exception:
+                        resp_body = "(could not read body)"
                     logger.warning(
-                        "Initial API call returned %s — reCAPTCHA may have "
-                        "blocked the request (attempt %s/%s)",
+                        "Initial API call returned %s (attempt %s/%s)"
+                        "\n  response body: %s",
                         initial_resp.status,
                         attempt,
                         max_attempts,
+                        resp_body,
+                    )
+                    # Check if reCAPTCHA Enterprise is available on the page
+                    recaptcha_state = self._page.evaluate(
+                        """() => {
+                            return {
+                                hasGrecaptcha: typeof grecaptcha !== 'undefined',
+                                hasEnterprise: typeof grecaptcha !== 'undefined'
+                                    && typeof grecaptcha.enterprise !== 'undefined',
+                                scriptTags: [...document.querySelectorAll('script[src*="recaptcha"]')]
+                                    .map(s => s.src),
+                            };
+                        }"""
+                    )
+                    logger.debug(
+                        "reCAPTCHA state: %s", recaptcha_state
                     )
                     continue
 
@@ -395,12 +416,23 @@ class YosemiteLodging(BaseProvider):
                     month_element.select_option(value=target_month_val)
 
                 response = target_resp_info.value
+                logger.debug(
+                    "Calendar API call: status=%s\n  url=%s",
+                    response.status,
+                    response.url,
+                )
                 if response.status != 200:
+                    try:
+                        resp_body = response.text()[:500]
+                    except Exception:
+                        resp_body = "(could not read body)"
                     logger.warning(
-                        "Calendar API call returned %s (attempt %s/%s)",
+                        "Calendar API call returned %s (attempt %s/%s)"
+                        "\n  response body: %s",
                         response.status,
                         attempt,
                         max_attempts,
+                        resp_body,
                     )
                     continue
 
