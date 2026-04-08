@@ -137,16 +137,42 @@ class YosemiteLodging(BaseProvider):
                     "Widget config top-level keys: %s",
                     list(self._widget_config.keys()),
                 )
-                # Look for room type / unit type info
-                for key in ["UnitTypes", "RoomTypes", "Units", "Products"]:
+                # Log Accommodation and Classes — these likely contain
+                # room type definitions per property.
+                for key in [
+                    "Accommodation", "Classes", "Rental",
+                    "UnitTypes", "RoomTypes", "Units", "Products",
+                ]:
                     if key in self._widget_config:
                         val = self._widget_config[key]
-                        logger.debug(
-                            "Widget config[%s] (%s items): %s",
-                            key,
-                            len(val) if isinstance(val, list) else "?",
-                            str(val)[:500],
-                        )
+                        if isinstance(val, dict):
+                            logger.debug(
+                                "Widget config[%s] keys: %s",
+                                key,
+                                list(val.keys()),
+                            )
+                            # Log first property's data
+                            for sub_key, sub_val in val.items():
+                                logger.debug(
+                                    "  config[%s][%s]: %s",
+                                    key,
+                                    sub_key,
+                                    str(sub_val)[:800],
+                                )
+                                break  # just first one
+                        elif isinstance(val, list):
+                            logger.debug(
+                                "Widget config[%s] (%s items): %s",
+                                key,
+                                len(val),
+                                str(val)[:800],
+                            )
+                        else:
+                            logger.debug(
+                                "Widget config[%s]: %s",
+                                key,
+                                str(val)[:800],
+                            )
         else:
             logger.debug("No widget config captured during page load")
         logger.info("Browser ready - search page loaded.")
