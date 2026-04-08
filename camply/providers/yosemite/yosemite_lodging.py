@@ -149,16 +149,11 @@ class YosemiteLodging(BaseProvider):
         initial_value = (
             f"{YosemiteConfig.YOSEMITE_RECREATION_AREA_ID}:{multiprop_code}"
         )
-
-        # Format first day of month as MM/DD/YYYY for the date inputs
-        first_of_month = f"{month:02d}/01/{year}"
-        # Last day of month
-        _, last_day = monthrange(year, month)
-        end_of_month = f"{month:02d}/{last_day:02d}/{year}"
+        target_month_val = str(month - 1)  # Page uses 0-indexed months
+        target_year_val = str(year)
 
         for attempt in range(1, max_attempts + 1):
-            # Reload the page to reset to the landing state where
-            # InitialProductSelection is visible.
+            # Reload the page to reset to the landing state
             self._page.goto(
                 YosemiteConfig.SEARCH_PAGE_URL, wait_until="networkidle"
             )
@@ -166,32 +161,48 @@ class YosemiteLodging(BaseProvider):
                 "#box-widget_InitialProductSelection", timeout=30000
             )
 
-            # Set arrival/departure dates BEFORE selecting property
-            # so the calendar starts at the right month
-            self._page.evaluate(
-                """([arrival, departure]) => {
-                    const arrInput = document.querySelector('input[name="InitialArrivalDate"]');
-                    const depInput = document.querySelector('input[name="InitialDepartureDate"]');
-                    if (arrInput) {
-                        arrInput.value = arrival;
-                        arrInput.dispatchEvent(new Event('change', {bubbles: true}));
-                    }
-                    if (depInput) {
-                        depInput.value = departure;
-                        depInput.dispatchEvent(new Event('change', {bubbles: true}));
-                    }
-                }""",
-                [first_of_month, end_of_month],
-            )
-
             try:
+                # Step 1: Select property — this transitions to the detail
+                # view and triggers an API call for the default month.
+                # We don't need this response, just wait for the page to
+                # transition so the calendar month/year selects appear.
+                self._page.select_option(
+                    "#box-widget_InitialProductSelection",
+                    value=initial_value,
+                )
+                # Wait for the detail view calendar to appear
+                self._page.wait_for_timeout(2000)
+
+                # Step 2: Navigate the calendar to the target month/year
+                # and capture THAT response (which has the right dates).
                 with self._page.expect_response(
                     lambda r: "GetInventoryCountData" in r.url,
                     timeout=30000,
                 ) as response_info:
-                    self._page.select_option(
-                        "#box-widget_InitialProductSelection",
-                        value=initial_value,
+                    self._page.evaluate(
+                        """([monthVal, yearVal]) => {
+                            const selects = [...document.querySelectorAll('select')];
+                            // Find year select (has year values like 2026, 2027)
+                            for (const sel of selects) {
+                                const vals = [...sel.options].map(o => o.value);
+                                if (vals.includes('2026') && vals.includes('2027')) {
+                                    sel.value = yearVal;
+                                    sel.dispatchEvent(new Event('change', {bubbles: true}));
+                                    break;
+                                }
+                            }
+                            // Find month select (has month abbreviations)
+                            for (const sel of selects) {
+                                const texts = [...sel.options].map(o => o.text);
+                                if (texts.some(t => ['Jun','Jul','Aug','Sep',
+                                                     'Oct','Nov','Dec'].includes(t))) {
+                                    sel.value = monthVal;
+                                    sel.dispatchEvent(new Event('change', {bubbles: true}));
+                                    break;
+                                }
+                            }
+                        }""",
+                        [target_month_val, target_year_val],
                     )
 
                 response = response_info.value
