@@ -51,6 +51,7 @@ class YosemiteLodging(BaseProvider):
         self._browser = None
         self._page = None
         self._browser_ready = False
+        self._initial_selection_done = False
 
     def _ensure_browser(self) -> None:
         """
@@ -101,6 +102,7 @@ class YosemiteLodging(BaseProvider):
             self._playwright = None
         self._page = None
         self._browser_ready = False
+        self._initial_selection_done = False
 
     def __del__(self):
         self._close_browser()
@@ -145,23 +147,30 @@ class YosemiteLodging(BaseProvider):
         """
         self._ensure_browser()
 
-        # InitialProductSelection uses "2:X" format (rec area ID : prop code)
-        initial_value = f"{YosemiteConfig.YOSEMITE_RECREATION_AREA_ID}:{multiprop_code}"
-
-        # First, reset to the placeholder to ensure a change event fires
-        self._page.select_option(
-            "#box-widget_InitialProductSelection", value=""
-        )
-        self._page.wait_for_timeout(300)
-
-        # Select the property and wait for the API response
-        with self._page.expect_response(
-            lambda r: "GetInventoryCountData" in r.url and r.status == 200,
-            timeout=30000,
-        ) as response_info:
-            self._page.select_option(
-                "#box-widget_InitialProductSelection", value=initial_value
+        if not self._initial_selection_done:
+            # First query: use the visible InitialProductSelection dropdown
+            # (values are "2:X" format — rec area ID : prop code)
+            initial_value = (
+                f"{YosemiteConfig.YOSEMITE_RECREATION_AREA_ID}:{multiprop_code}"
             )
+            with self._page.expect_response(
+                lambda r: "GetInventoryCountData" in r.url and r.status == 200,
+                timeout=30000,
+            ) as response_info:
+                self._page.select_option(
+                    "#box-widget_InitialProductSelection", value=initial_value
+                )
+            self._initial_selection_done = True
+        else:
+            # Subsequent queries: the page transitioned to the detailed view
+            # where ProductSelection (values "D","H","M","T","Y") is now visible
+            with self._page.expect_response(
+                lambda r: "GetInventoryCountData" in r.url and r.status == 200,
+                timeout=30000,
+            ) as response_info:
+                self._page.select_option(
+                    "#box-widget_ProductSelection", value=multiprop_code
+                )
 
         response = response_info.value
         text = response.text()
