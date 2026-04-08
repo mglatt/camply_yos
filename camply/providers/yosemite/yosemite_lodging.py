@@ -150,6 +150,12 @@ class YosemiteLodging(BaseProvider):
             f"{YosemiteConfig.YOSEMITE_RECREATION_AREA_ID}:{multiprop_code}"
         )
 
+        # Format first day of month as MM/DD/YYYY for the date inputs
+        first_of_month = f"{month:02d}/01/{year}"
+        # Last day of month
+        _, last_day = monthrange(year, month)
+        end_of_month = f"{month:02d}/{last_day:02d}/{year}"
+
         for attempt in range(1, max_attempts + 1):
             # Reload the page to reset to the landing state where
             # InitialProductSelection is visible.
@@ -158,6 +164,24 @@ class YosemiteLodging(BaseProvider):
             )
             self._page.wait_for_selector(
                 "#box-widget_InitialProductSelection", timeout=30000
+            )
+
+            # Set arrival/departure dates BEFORE selecting property
+            # so the calendar starts at the right month
+            self._page.evaluate(
+                """([arrival, departure]) => {
+                    const arrInput = document.querySelector('input[name="InitialArrivalDate"]');
+                    const depInput = document.querySelector('input[name="InitialDepartureDate"]');
+                    if (arrInput) {
+                        arrInput.value = arrival;
+                        arrInput.dispatchEvent(new Event('change', {bubbles: true}));
+                    }
+                    if (depInput) {
+                        depInput.value = departure;
+                        depInput.dispatchEvent(new Event('change', {bubbles: true}));
+                    }
+                }""",
+                [first_of_month, end_of_month],
             )
 
             try:
