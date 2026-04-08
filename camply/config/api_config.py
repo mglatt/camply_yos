@@ -202,3 +202,60 @@ class YellowstoneConfig(DataColumns, APIConfig):
                 facility_id=str(key),
             )
         )
+
+
+class YosemiteConfig(DataColumns, APIConfig):
+    """
+    Yosemite National Park Lodging Configuration (Aramark/AHLS)
+    """
+
+    API_BASE_URL: str = "https://reservations.ahlsmsworld.com"
+    API_SEARCH_PATH: str = "/Yosemite/Search/GetInventoryCountData"
+    API_CONFIG_PATH: str = "/Yosemite/Search/GetWidgetConfigData"
+    BOOKING_BASE_URL: str = (
+        "https://reservations.ahlsmsworld.com/Yosemite/Plan-Your-Trip/Accommodations"
+    )
+    SEARCH_PAGE_URL: str = (
+        "https://reservations.ahlsmsworld.com/Yosemite/Plan-Your-Trip/"
+    )
+
+    CRES_PROP_CODE: str = "000000"
+    RECAPTCHA_SITE_KEY: str = "6LfKL4EfAAAAAQhWM8Rc-UGM02Z1Z0LRgEuqzDS"
+
+    YOSEMITE_RECREATION_AREA_ID: int = 2
+    YOSEMITE_RECREATION_AREA_NAME: str = "Yosemite"
+    YOSEMITE_RECREATION_AREA_FULL_NAME: str = "Yosemite National Park"
+    YOSEMITE_RECREATION_AREA_FORMAL_NAME: str = "Yosemite National Park, USA"
+    YOSEMITE_LOOP_NAME: str = "N/A"
+    CAMPSITE_AVAILABILITY_STATUS: str = "Available"
+
+    YOSEMITE_TIMEZONE: str = "America/Los_Angeles"
+
+    MINIMUM_POLLING_INTERVAL: int = 60
+
+    YOSEMITE_PROPERTIES: Dict[str, str] = {
+        "D": "Curry Village",
+        "H": "Housekeeping Camp",
+        "M": "The Ahwahnee",
+        "T": "Tuolumne Meadows Lodge",
+        "Y": "Yosemite Valley Lodge",
+    }
+
+    YOSEMITE_PROPERTY_SLUGS: Dict[str, str] = {
+        "D": "Curry-Village",
+        "H": "Housekeeping-Camp",
+        "M": "The-Ahwahnee",
+        "T": "Tuolumne-Meadows-Lodge",
+        "Y": "Yosemite-Valley-Lodge",
+    }
+
+    YOSEMITE_CAMPGROUND_OBJECTS: List[CampgroundFacility] = []
+    for key, value in YOSEMITE_PROPERTIES.items():
+        YOSEMITE_CAMPGROUND_OBJECTS.append(
+            CampgroundFacility(
+                recreation_area_id=YOSEMITE_RECREATION_AREA_ID,
+                recreation_area=YOSEMITE_RECREATION_AREA_FORMAL_NAME,
+                facility_name=value,
+                facility_id=str(key),
+            )
+        )
