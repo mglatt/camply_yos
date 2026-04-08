@@ -26,6 +26,45 @@ from camply.utils import logging_utils
 
 logger = logging.getLogger(__name__)
 
+# JavaScript snippet that locates the year <select> on the AHLS calendar.
+# Uses a regex (/^20\d{2}$/) so it works across year boundaries without
+# hard-coding specific values like '2026'.
+_JS_FIND_YEAR_SELECT = """() => {
+    const selects = [...document.querySelectorAll('select')];
+    return selects.find(s =>
+        [...s.options].some(o => /^20\\d{2}$/.test(o.value))
+    ) || null;
+}"""
+
+# JavaScript snippet that locates the month <select> by checking for
+# standard 3-letter English month abbreviations in option text.
+_JS_FIND_MONTH_SELECT = """() => {
+    const selects = [...document.querySelectorAll('select')];
+    return selects.find(s => {
+        const texts = [...s.options].map(o => o.text);
+        return texts.some(t =>
+            ['Jan','Feb','Mar','Apr','May','Jun',
+             'Jul','Aug','Sep','Oct','Nov','Dec'].includes(t)
+        );
+    }) || null;
+}"""
+
+# JavaScript snippet that checks whether both calendar selects are present.
+_JS_CALENDAR_READY = """() => {
+    const selects = [...document.querySelectorAll('select')];
+    const hasYear = selects.some(s =>
+        [...s.options].some(o => /^20\\d{2}$/.test(o.value))
+    );
+    const hasMonth = selects.some(s => {
+        const texts = [...s.options].map(o => o.text);
+        return texts.some(t =>
+            ['Jan','Feb','Mar','Apr','May','Jun',
+             'Jul','Aug','Sep','Oct','Nov','Dec'].includes(t)
+        );
+    });
+    return hasYear && hasMonth;
+}"""
+
 
 class YosemiteLodging(BaseProvider):
     """
@@ -74,15 +113,38 @@ class YosemiteLodging(BaseProvider):
             headless=True,
             args=[
                 "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
             ],
         )
         context = self._browser.new_context(
             user_agent=self.session.headers.get("User-Agent", ""),
+            viewport={"width": 1920, "height": 1080},
+            locale="en-US",
+            timezone_id=YosemiteConfig.YOSEMITE_TIMEZONE,
         )
         self._page = context.new_page()
+        # Basic stealth: hide common automation indicators.
         self._page.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+            """
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [1, 2, 3, 4, 5]
+            });
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['en-US', 'en']
+            });
+            window.chrome = { runtime: {} };
+            """
         )
+        # Optional enhanced stealth via playwright-stealth package.
+        try:
+            from playwright_stealth import stealth_sync
+
+            stealth_sync(self._page)
+            logger.debug("playwright-stealth applied")
+        except ImportError:
+            pass
         self._page.goto(YosemiteConfig.SEARCH_PAGE_URL, wait_until="networkidle")
         # Wait for the visible search widget to be ready
         self._page.wait_for_selector(
@@ -115,6 +177,32 @@ class YosemiteLodging(BaseProvider):
             return json.loads(match.group(1))
         return json.loads(text)
 
+    def _log_page_selects(self) -> None:
+        """
+        Log all <select> elements on the page for debugging.
+        Helps diagnose when calendar selects cannot be found.
+        """
+        try:
+            selects_info = self._page.evaluate(
+                """() => {
+                    return [...document.querySelectorAll('select')].map(s => ({
+                        id: s.id,
+                        name: s.name,
+                        visible: s.offsetParent !== null,
+                        optionCount: s.options.length,
+                        sampleOptions: [...s.options].slice(0, 5).map(o => ({
+                            value: o.value, text: o.text
+                        })),
+                    }));
+                }"""
+            )
+            logger.warning(
+                "Page select elements:\n%s",
+                json.dumps(selects_info, indent=2),
+            )
+        except Exception as exc:
+            logger.debug("Could not log page selects: %s", exc)
+
     def _get_inventory_count(
         self,
         multiprop_code: str,
@@ -123,11 +211,11 @@ class YosemiteLodging(BaseProvider):
     ) -> list:
         """
         Get inventory count by selecting a property in the page's
-        InitialProductSelection dropdown, then intercepting the
-        GetInventoryCountData API response.
+        InitialProductSelection dropdown, then navigating the calendar
+        and intercepting the GetInventoryCountData API response.
 
         The page handles reCAPTCHA Enterprise internally when the
-        dropdown triggers the calendar widget search.
+        dropdown and calendar changes trigger the search widget.
 
         Parameters
         ----------
@@ -162,63 +250,170 @@ class YosemiteLodging(BaseProvider):
             )
 
             try:
-                # Step 1: Select property — this transitions to the detail
-                # view and triggers an API call for the default month.
-                # We don't need this response, just wait for the page to
-                # transition so the calendar month/year selects appear.
-                self._page.select_option(
-                    "#box-widget_InitialProductSelection",
-                    value=initial_value,
-                )
-                # Wait for the detail view calendar to appear
-                self._page.wait_for_timeout(2000)
-
-                # Step 2: Navigate the calendar to the target month/year
-                # and capture THAT response (which has the right dates).
+                # ----------------------------------------------------------
+                # Step 1: Select property.
+                # This triggers reCAPTCHA and an API call for the *default*
+                # month.  We MUST consume this response so it does not leak
+                # into Step 3's expect_response (which would then return
+                # data for the wrong month).
+                # ----------------------------------------------------------
                 with self._page.expect_response(
                     lambda r: "GetInventoryCountData" in r.url,
                     timeout=30000,
-                ) as response_info:
-                    self._page.evaluate(
-                        """([monthVal, yearVal]) => {
-                            const selects = [...document.querySelectorAll('select')];
-                            // Find year select (has year values like 2026, 2027)
-                            for (const sel of selects) {
-                                const vals = [...sel.options].map(o => o.value);
-                                if (vals.includes('2026') && vals.includes('2027')) {
-                                    sel.value = yearVal;
-                                    sel.dispatchEvent(new Event('change', {bubbles: true}));
-                                    break;
-                                }
-                            }
-                            // Find month select (has month abbreviations)
-                            for (const sel of selects) {
-                                const texts = [...sel.options].map(o => o.text);
-                                if (texts.some(t => ['Jun','Jul','Aug','Sep',
-                                                     'Oct','Nov','Dec'].includes(t))) {
-                                    sel.value = monthVal;
-                                    sel.dispatchEvent(new Event('change', {bubbles: true}));
-                                    break;
-                                }
-                            }
-                        }""",
-                        [target_month_val, target_year_val],
+                ) as initial_resp_info:
+                    self._page.select_option(
+                        "#box-widget_InitialProductSelection",
+                        value=initial_value,
                     )
 
-                response = response_info.value
-                if response.status != 200:
+                initial_resp = initial_resp_info.value
+                logger.debug(
+                    "Initial API call: status=%s url=%s",
+                    initial_resp.status,
+                    initial_resp.url[:200],
+                )
+
+                if initial_resp.status != 200:
                     logger.warning(
-                        f"API returned {response.status} on attempt "
-                        f"{attempt}/{max_attempts}"
+                        "Initial API call returned %s — reCAPTCHA may have "
+                        "blocked the request (attempt %s/%s)",
+                        initial_resp.status,
+                        attempt,
+                        max_attempts,
                     )
                     continue
+
+                # ----------------------------------------------------------
+                # Step 2: Wait for calendar month/year <select> elements.
+                # After property selection the page transitions to a detail
+                # view with a calendar widget.  We wait for the year and
+                # month selects to appear rather than using a fixed timeout.
+                # ----------------------------------------------------------
+                try:
+                    self._page.wait_for_function(
+                        _JS_CALENDAR_READY, timeout=10000
+                    )
+                except Exception:
+                    logger.warning(
+                        "Calendar selects did not appear after property "
+                        "selection (attempt %s/%s)",
+                        attempt,
+                        max_attempts,
+                    )
+                    self._log_page_selects()
+                    continue
+
+                # Read current calendar state so we only change what's needed.
+                cal_state = self._page.evaluate(
+                    """() => {
+                        const selects = [...document.querySelectorAll('select')];
+                        let yearVal = null, monthVal = null;
+                        for (const s of selects) {
+                            if ([...s.options].some(o => /^20\\d{2}$/.test(o.value)))
+                                yearVal = s.value;
+                        }
+                        for (const s of selects) {
+                            const texts = [...s.options].map(o => o.text);
+                            if (texts.some(t =>
+                                ['Jan','Feb','Mar','Apr','May','Jun',
+                                 'Jul','Aug','Sep','Oct','Nov','Dec'].includes(t)
+                            ))
+                                monthVal = s.value;
+                        }
+                        return {yearVal: yearVal, monthVal: monthVal};
+                    }"""
+                )
+                logger.debug(
+                    "Calendar state: year=%s month=%s (target: year=%s month=%s)",
+                    cal_state.get("yearVal"),
+                    cal_state.get("monthVal"),
+                    target_year_val,
+                    target_month_val,
+                )
+
+                # If the default calendar already shows our target, the
+                # initial response has the data we need.
+                if (
+                    cal_state.get("yearVal") == target_year_val
+                    and cal_state.get("monthVal") == target_month_val
+                ):
+                    return self._parse_jsonp(initial_resp.text())
+
+                # ----------------------------------------------------------
+                # Step 3: Navigate the calendar to the target month/year.
+                #
+                # KEY FIX: Use Playwright's select_option() on ElementHandles
+                # instead of JavaScript dispatchEvent(new Event('change')).
+                # Playwright triggers *trusted* native browser events
+                # (isTrusted=true) which framework event handlers (jQuery,
+                # React, Angular) recognise.  The old dispatchEvent approach
+                # created *untrusted* synthetic events that frameworks may
+                # silently ignore, preventing the widget from making the API
+                # call.
+                # ----------------------------------------------------------
+                year_handle = self._page.evaluate_handle(_JS_FIND_YEAR_SELECT)
+                month_handle = self._page.evaluate_handle(_JS_FIND_MONTH_SELECT)
+
+                year_element = year_handle.as_element()
+                month_element = month_handle.as_element()
+
+                if not year_element or not month_element:
+                    logger.warning(
+                        "Could not get element handles for calendar selects "
+                        "(attempt %s/%s)",
+                        attempt,
+                        max_attempts,
+                    )
+                    self._log_page_selects()
+                    continue
+
+                # 3a. Change year first (if needed).
+                # Changing the year may or may not trigger its own API call
+                # (depends on the widget implementation).  If it does, we
+                # consume the response so it doesn't leak into 3b.
+                if cal_state.get("yearVal") != target_year_val:
+                    try:
+                        with self._page.expect_response(
+                            lambda r: "GetInventoryCountData" in r.url,
+                            timeout=10000,
+                        ):
+                            year_element.select_option(value=target_year_val)
+                        logger.debug("Year change triggered an API call (consumed)")
+                    except Exception:
+                        # Year change alone didn't trigger an API call — that's
+                        # fine, the month change will trigger the combined call.
+                        logger.debug(
+                            "Year change did not trigger a separate API call"
+                        )
+
+                # 3b. Change month and capture the response.
+                # This is the response that contains the target month/year data.
+                with self._page.expect_response(
+                    lambda r: "GetInventoryCountData" in r.url,
+                    timeout=30000,
+                ) as target_resp_info:
+                    month_element.select_option(value=target_month_val)
+
+                response = target_resp_info.value
+                if response.status != 200:
+                    logger.warning(
+                        "Calendar API call returned %s (attempt %s/%s)",
+                        response.status,
+                        attempt,
+                        max_attempts,
+                    )
+                    continue
+
                 text = response.text()
                 return self._parse_jsonp(text)
 
             except Exception as e:
                 if attempt < max_attempts:
                     logger.info(
-                        f"Attempt {attempt}/{max_attempts} failed, retrying..."
+                        "Attempt %s/%s failed (%s), retrying...",
+                        attempt,
+                        max_attempts,
+                        e,
                     )
                 else:
                     raise
