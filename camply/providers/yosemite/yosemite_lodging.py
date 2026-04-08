@@ -178,14 +178,27 @@ class YosemiteLodging(BaseProvider):
             f"{YosemiteConfig.YOSEMITE_RECREATION_AREA_ID}:{multiprop_code}"
         )
 
-        # Build target StartDate using the browser's JS engine.
-        # The AHLS widget sends the short date form produced by
-        # Date.toDateString() — e.g. "Wed Jul 01 2026" — NOT the
-        # full Date.toString() that includes time and timezone.
-        target_date_str = self._page.evaluate(
+        # Build target StartDate and EndDate using the browser's JS
+        # engine.  The AHLS widget uses Date.toDateString() format
+        # (e.g. "Wed Jul 01 2026") and sends a 3-month window.
+        # Both must be rewritten or the server rejects the range.
+        target_start_str = self._page.evaluate(
             f"new Date({year}, {month - 1}, 1).toDateString()"
         )
-        logger.debug("Target StartDate: %s", target_date_str)
+        # EndDate = last day of the month 2 months after StartDate
+        # (mirroring the widget's 3-month window: Mar 1 → May 31).
+        end_month = month + 2
+        end_year = year
+        if end_month > 12:
+            end_month -= 12
+            end_year += 1
+        _, end_last_day = monthrange(end_year, end_month)
+        target_end_str = self._page.evaluate(
+            f"new Date({end_year}, {end_month - 1}, {end_last_day}).toDateString()"
+        )
+        logger.debug(
+            "Target date range: %s -> %s", target_start_str, target_end_str
+        )
 
         for attempt in range(1, max_attempts + 1):
             # Reload the page to reset to the landing state
@@ -269,30 +282,43 @@ class YosemiteLodging(BaseProvider):
                         "#box-widget_InitialProductSelection", timeout=30000
                     )
 
-                    def _rewrite_start_date(route):
+                    def _rewrite_dates(route):
                         url = route.request.url
                         if "GetInventoryCountData" not in url:
                             route.continue_()
                             return
-                        sd_match = re.search(r"(StartDate=)([^&]*)", url)
+                        new_url = url
+                        # Rewrite StartDate
+                        sd_match = re.search(
+                            r"(StartDate=)([^&]*)", new_url
+                        )
                         if sd_match:
-                            target_encoded = quote_plus(target_date_str)
+                            enc_start = quote_plus(target_start_str)
                             new_url = (
-                                url[: sd_match.start(2)]
-                                + target_encoded
-                                + url[sd_match.end(2) :]
+                                new_url[: sd_match.start(2)]
+                                + enc_start
+                                + new_url[sd_match.end(2) :]
                             )
-                            logger.debug(
-                                "Rewrote StartDate: %s -> %s",
-                                sd_match.group(2)[:30],
-                                target_encoded[:30],
+                        # Rewrite EndDate
+                        ed_match = re.search(
+                            r"(EndDate=)([^&]*)", new_url
+                        )
+                        if ed_match:
+                            enc_end = quote_plus(target_end_str)
+                            new_url = (
+                                new_url[: ed_match.start(2)]
+                                + enc_end
+                                + new_url[ed_match.end(2) :]
                             )
-                            route.continue_(url=new_url)
-                        else:
-                            route.continue_()
+                        logger.debug(
+                            "Rewrote dates: StartDate=%s, EndDate=%s",
+                            quote_plus(target_start_str)[:25],
+                            quote_plus(target_end_str)[:25],
+                        )
+                        route.continue_(url=new_url)
 
                     self._page.route(
-                        "**/GetInventoryCountData*", _rewrite_start_date
+                        "**/GetInventoryCountData*", _rewrite_dates
                     )
 
                     with self._page.expect_response(
