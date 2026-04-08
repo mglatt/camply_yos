@@ -4,14 +4,13 @@ Yosemite National Park Lodging Provider
 Uses the Aramark/AHLS booking system at reservations.ahlsmsworld.com
 to check availability for Yosemite lodging properties.
 
-Requires Playwright for reCAPTCHA v3 token generation:
+Requires Playwright for reCAPTCHA token generation and API calls:
     pip install playwright && python -m playwright install chromium
 """
 
 import json
 import logging
 import re
-import time
 from calendar import monthrange
 from datetime import datetime, timedelta
 from typing import List, Optional
@@ -31,6 +30,9 @@ class YosemiteLodging(BaseProvider):
     Searches the Aramark/AHLS reservation system for availability
     at Yosemite lodging properties (Curry Village, Housekeeping Camp,
     The Ahwahnee, Tuolumne Meadows Lodge, Yosemite Valley Lodge).
+
+    All API calls run inside a headless browser to handle reCAPTCHA
+    Enterprise token generation natively.
     """
 
     recreation_area = RecreationArea(
@@ -44,24 +46,12 @@ class YosemiteLodging(BaseProvider):
         self._playwright = None
         self._browser = None
         self._page = None
-        self._browser_cookies_synced = False
         self._recaptcha_ready = False
-        self._use_enterprise = False
-        self._site_key = None
-        self.session.headers.update(
-            {
-                "Accept": "text/javascript, application/javascript, "
-                "application/ecmascript, application/x-ecmascript, */*; q=0.01",
-                "X-Requested-With": "XMLHttpRequest",
-                "Referer": YosemiteConfig.SEARCH_PAGE_URL,
-                "Host": "reservations.ahlsmsworld.com",
-            }
-        )
 
     def _ensure_browser(self) -> None:
         """
         Launch headless browser and navigate to the search page
-        so that reCAPTCHA v3 is loaded and ready to generate tokens.
+        so that reCAPTCHA is loaded and ready to generate tokens.
         """
         if self._page is not None and self._recaptcha_ready:
             return
@@ -104,69 +94,32 @@ class YosemiteLodging(BaseProvider):
             }""",
             timeout=60000,
         )
-        # Detect which API variant is available
-        self._use_enterprise = self._page.evaluate(
-            "typeof grecaptcha.enterprise !== 'undefined' "
-            "&& typeof grecaptcha.enterprise.execute === 'function'"
-        )
-        # Extract site key from the page instead of using hardcoded value
-        self._site_key = self._page.evaluate(
+        # Extract the reCAPTCHA action string from the page's own JavaScript
+        self._page.evaluate(
             """() => {
-                // Try the render= parameter in the recaptcha script URL
-                const scripts = document.querySelectorAll('script[src*="recaptcha"]');
-                for (const s of scripts) {
-                    const m = s.src.match(/[?&]render=([^&]+)/);
-                    if (m && m[1] !== 'explicit') return m[1];
+                // Monkeypatch execute to capture the action string the page uses
+                window.__capturedRecaptchaAction = null;
+                window.__capturedRecaptchaSiteKey = null;
+                const patchExec = (obj, name) => {
+                    const orig = obj[name].bind(obj);
+                    obj[name] = function(siteKey, options) {
+                        window.__capturedRecaptchaSiteKey = siteKey;
+                        if (options && options.action) {
+                            window.__capturedRecaptchaAction = options.action;
+                        }
+                        return orig(siteKey, options);
+                    };
+                };
+                if (typeof grecaptcha.enterprise !== 'undefined' &&
+                    typeof grecaptcha.enterprise.execute === 'function') {
+                    patchExec(grecaptcha.enterprise, 'execute');
+                } else if (typeof grecaptcha.execute === 'function') {
+                    patchExec(grecaptcha, 'execute');
                 }
-                // Try data-sitekey attributes
-                const el = document.querySelector('[data-sitekey]');
-                if (el) return el.getAttribute('data-sitekey');
-                return null;
             }"""
         )
-        if not self._site_key:
-            # Fall back to config value
-            self._site_key = YosemiteConfig.RECAPTCHA_SITE_KEY
-        api_type = "enterprise" if self._use_enterprise else "standard"
-        logger.info(
-            f"Browser ready - reCAPTCHA loaded ({api_type} API, "
-            f"site key: {self._site_key[:8]}...)."
-        )
+        logger.info("Browser ready - reCAPTCHA loaded.")
         self._recaptcha_ready = True
-
-    def _get_recaptcha_token(self) -> str:
-        """
-        Generate a fresh reCAPTCHA v3 token using the browser session.
-        Tokens are single-use and expire in ~2 minutes.
-        """
-        self._ensure_browser()
-        site_key = self._site_key
-        if self._use_enterprise:
-            token = self._page.evaluate(
-                f"grecaptcha.enterprise.execute('{site_key}', {{action: 'submit'}})"
-            )
-        else:
-            token = self._page.evaluate(
-                f"grecaptcha.execute('{site_key}', {{action: 'submit'}})"
-            )
-        return token
-
-    def _sync_browser_cookies(self) -> None:
-        """
-        Copy cookies from the Playwright browser context to the requests session.
-        """
-        if self._browser_cookies_synced:
-            return
-        self._ensure_browser()
-        cookies = self._page.context.cookies()
-        for cookie in cookies:
-            self.session.cookies.set(
-                cookie["name"],
-                cookie["value"],
-                domain=cookie.get("domain", ""),
-                path=cookie.get("path", "/"),
-            )
-        self._browser_cookies_synced = True
 
     def _close_browser(self) -> None:
         """Clean up browser resources."""
@@ -177,7 +130,6 @@ class YosemiteLodging(BaseProvider):
             self._playwright.stop()
             self._playwright = None
         self._page = None
-        self._browser_cookies_synced = False
         self._recaptcha_ready = False
 
     def __del__(self):
@@ -215,7 +167,12 @@ class YosemiteLodging(BaseProvider):
         end_date: datetime,
     ) -> list:
         """
-        Call the GetInventoryCountData API for a property and date range.
+        Call the GetInventoryCountData API from inside the browser context.
+
+        This makes the fetch call from the same browser session that loaded
+        reCAPTCHA, so token generation, cookies, and headers are all handled
+        natively by the browser — no need to sync cookies or pass tokens
+        through an external HTTP client.
 
         Parameters
         ----------
@@ -231,22 +188,76 @@ class YosemiteLodging(BaseProvider):
         list
             List of dicts with 'DateKey' and 'AvailableCount'
         """
-        self._sync_browser_cookies()
-        token = self._get_recaptcha_token()
-        params = {
-            "callback": "camply_callback",
-            "CresPropCode": YosemiteConfig.CRES_PROP_CODE,
-            "MultiPropCode": multiprop_code,
-            "UnitTypeCode": "",
-            "StartDate": self._format_date_for_api(start_date),
-            "EndDate": self._format_date_for_api(end_date),
-            "RecaptchaToken": token,
-            "_": str(int(time.time() * 1000)),
-        }
-        url = f"{YosemiteConfig.API_BASE_URL}{YosemiteConfig.API_SEARCH_PATH}"
-        response = self.session.get(url, params=params, timeout=30)
-        response.raise_for_status()
-        return self._parse_jsonp(response.text)
+        self._ensure_browser()
+        start_str = self._format_date_for_api(start_date)
+        end_str = self._format_date_for_api(end_date)
+
+        result = self._page.evaluate(
+            """async ([multiPropCode, cresPropCode, startDate, endDate, searchPath]) => {
+                // Determine which execute function to use
+                const isEnterprise = (typeof grecaptcha.enterprise !== 'undefined' &&
+                    typeof grecaptcha.enterprise.execute === 'function');
+                const execFn = isEnterprise
+                    ? grecaptcha.enterprise.execute.bind(grecaptcha.enterprise)
+                    : grecaptcha.execute.bind(grecaptcha);
+
+                // Extract site key from the recaptcha script tag
+                let siteKey = null;
+                const scripts = document.querySelectorAll('script[src*="recaptcha"]');
+                for (const s of scripts) {
+                    const m = s.src.match(/[?&]render=([^&]+)/);
+                    if (m && m[1] !== 'explicit') { siteKey = m[1]; break; }
+                }
+                if (!siteKey) {
+                    const el = document.querySelector('[data-sitekey]');
+                    if (el) siteKey = el.getAttribute('data-sitekey');
+                }
+                if (!siteKey) throw new Error('Could not find reCAPTCHA site key on page');
+
+                // Use captured action if available, otherwise try common actions
+                const action = window.__capturedRecaptchaAction || 'submit';
+
+                // Generate token
+                const token = await execFn(siteKey, {action: action});
+
+                // Build the API URL
+                const params = new URLSearchParams({
+                    CresPropCode: cresPropCode,
+                    MultiPropCode: multiPropCode,
+                    UnitTypeCode: '',
+                    StartDate: startDate,
+                    EndDate: endDate,
+                    RecaptchaToken: token,
+                    _: Date.now().toString()
+                });
+
+                const response = await fetch(searchPath + '?' + params.toString(), {
+                    headers: {
+                        'X-Requested-With': 'XMLHttpRequest',
+                        'Accept': 'application/json, text/javascript, */*; q=0.01'
+                    }
+                });
+
+                if (!response.ok) {
+                    const body = await response.text().catch(() => '');
+                    throw new Error('HTTP ' + response.status + ': ' + response.statusText + ' - ' + body.substring(0, 200));
+                }
+
+                const text = await response.text();
+                // Parse JSONP wrapper if present
+                const match = text.match(/^[^(\\[{]+\\((.+)\\);?\\s*$/s);
+                if (match) return JSON.parse(match[1]);
+                return JSON.parse(text);
+            }""",
+            [
+                multiprop_code,
+                YosemiteConfig.CRES_PROP_CODE,
+                start_str,
+                end_str,
+                YosemiteConfig.API_SEARCH_PATH,
+            ],
+        )
+        return result
 
     def _build_booking_url(self, property_code: str) -> str:
         """Build a browser-loadable booking URL for a property."""
