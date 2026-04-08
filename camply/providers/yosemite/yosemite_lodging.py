@@ -4,9 +4,10 @@ Yosemite National Park Lodging Provider
 Uses the Aramark/AHLS booking system at reservations.ahlsmsworld.com
 to check availability for Yosemite lodging properties.
 
-Automates the search page via Playwright — selects properties and months
-in the calendar widget, and intercepts the GetInventoryCountData API
-responses. This lets the page handle reCAPTCHA Enterprise internally.
+Automates the search page via Playwright — selects properties from the
+dropdown, intercepts the outgoing GetInventoryCountData API request,
+rewrites the StartDate parameter to the target month, and captures the
+response.  The page handles reCAPTCHA Enterprise internally.
 
 Requires Playwright:
     pip install playwright && python -m playwright install chromium
@@ -18,6 +19,7 @@ import re
 from calendar import monthrange
 from datetime import datetime, timedelta
 from typing import List, Optional
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from camply.config.api_config import YosemiteConfig
 from camply.containers import AvailableCampsite, CampgroundFacility, RecreationArea
@@ -25,45 +27,6 @@ from camply.providers.base_provider import BaseProvider
 from camply.utils import logging_utils
 
 logger = logging.getLogger(__name__)
-
-# JavaScript snippet that locates the year <select> on the AHLS calendar.
-# Uses a regex (/^20\d{2}$/) so it works across year boundaries without
-# hard-coding specific values like '2026'.
-_JS_FIND_YEAR_SELECT = """() => {
-    const selects = [...document.querySelectorAll('select')];
-    return selects.find(s =>
-        [...s.options].some(o => /^20\\d{2}$/.test(o.value))
-    ) || null;
-}"""
-
-# JavaScript snippet that locates the month <select> by checking for
-# standard 3-letter English month abbreviations in option text.
-_JS_FIND_MONTH_SELECT = """() => {
-    const selects = [...document.querySelectorAll('select')];
-    return selects.find(s => {
-        const texts = [...s.options].map(o => o.text);
-        return texts.some(t =>
-            ['Jan','Feb','Mar','Apr','May','Jun',
-             'Jul','Aug','Sep','Oct','Nov','Dec'].includes(t)
-        );
-    }) || null;
-}"""
-
-# JavaScript snippet that checks whether both calendar selects are present.
-_JS_CALENDAR_READY = """() => {
-    const selects = [...document.querySelectorAll('select')];
-    const hasYear = selects.some(s =>
-        [...s.options].some(o => /^20\\d{2}$/.test(o.value))
-    );
-    const hasMonth = selects.some(s => {
-        const texts = [...s.options].map(o => o.text);
-        return texts.some(t =>
-            ['Jan','Feb','Mar','Apr','May','Jun',
-             'Jul','Aug','Sep','Oct','Nov','Dec'].includes(t)
-        );
-    });
-    return hasYear && hasMonth;
-}"""
 
 
 class YosemiteLodging(BaseProvider):
@@ -177,32 +140,6 @@ class YosemiteLodging(BaseProvider):
             return json.loads(match.group(1))
         return json.loads(text)
 
-    def _log_page_selects(self) -> None:
-        """
-        Log all <select> elements on the page for debugging.
-        Helps diagnose when calendar selects cannot be found.
-        """
-        try:
-            selects_info = self._page.evaluate(
-                """() => {
-                    return [...document.querySelectorAll('select')].map(s => ({
-                        id: s.id,
-                        name: s.name,
-                        visible: s.offsetParent !== null,
-                        optionCount: s.options.length,
-                        sampleOptions: [...s.options].slice(0, 5).map(o => ({
-                            value: o.value, text: o.text
-                        })),
-                    }));
-                }"""
-            )
-            logger.warning(
-                "Page select elements:\n%s",
-                json.dumps(selects_info, indent=2),
-            )
-        except Exception as exc:
-            logger.debug("Could not log page selects: %s", exc)
-
     def _get_inventory_count(
         self,
         multiprop_code: str,
@@ -210,12 +147,15 @@ class YosemiteLodging(BaseProvider):
         year: int,
     ) -> list:
         """
-        Get inventory count by selecting a property in the page's
-        InitialProductSelection dropdown, then navigating the calendar
+        Get inventory count by selecting a property from the dropdown
         and intercepting the GetInventoryCountData API response.
 
-        The page handles reCAPTCHA Enterprise internally when the
-        dropdown and calendar changes trigger the search widget.
+        The AHLS widget does NOT expose month/year <select> elements.
+        Instead, the target month is controlled via the ``StartDate``
+        query parameter in the API URL.  We use Playwright route
+        interception to rewrite that parameter before the request
+        leaves the browser, so the page's own reCAPTCHA Enterprise
+        token stays valid while we get data for the month we want.
 
         Parameters
         ----------
@@ -237,8 +177,14 @@ class YosemiteLodging(BaseProvider):
         initial_value = (
             f"{YosemiteConfig.YOSEMITE_RECREATION_AREA_ID}:{multiprop_code}"
         )
-        target_month_val = str(month - 1)  # Page uses 0-indexed months
-        target_year_val = str(year)
+
+        # Build target StartDate using the browser's JS engine so the
+        # format (including timezone name) matches exactly what the
+        # AHLS widget would produce.
+        target_date_str = self._page.evaluate(
+            f"new Date({year}, {month - 1}, 1).toString()"
+        )
+        logger.debug("Target StartDate: %s", target_date_str)
 
         for attempt in range(1, max_attempts + 1):
             # Reload the page to reset to the landing state
@@ -251,184 +197,68 @@ class YosemiteLodging(BaseProvider):
 
             try:
                 # ----------------------------------------------------------
-                # Step 1: Select property.
-                # This triggers reCAPTCHA and an API call for the *default*
-                # month.  We MUST consume this response so it does not leak
-                # into Step 3's expect_response (which would then return
-                # data for the wrong month).
+                # Set up route interception to rewrite the StartDate
+                # parameter in the outgoing GetInventoryCountData request.
+                # The widget fires this request automatically when a
+                # property is selected; we just swap the date.
+                # ----------------------------------------------------------
+                def _rewrite_start_date(route):
+                    url = route.request.url
+                    if "GetInventoryCountData" not in url:
+                        route.continue_()
+                        return
+
+                    parsed = urlparse(url)
+                    params = parse_qs(parsed.query, keep_blank_values=True)
+
+                    if "StartDate" in params:
+                        original = params["StartDate"][0]
+                        params["StartDate"] = [target_date_str]
+                        new_query = urlencode(params, doseq=True)
+                        new_url = urlunparse(parsed._replace(query=new_query))
+                        logger.debug(
+                            "Rewrote StartDate: %s -> %s",
+                            original[:30],
+                            target_date_str[:30],
+                        )
+                        route.continue_(url=new_url)
+                    else:
+                        logger.debug(
+                            "No StartDate param found in API URL, "
+                            "forwarding unmodified"
+                        )
+                        route.continue_()
+
+                self._page.route(
+                    "**/GetInventoryCountData*", _rewrite_start_date
+                )
+
+                # ----------------------------------------------------------
+                # Select property — triggers reCAPTCHA Enterprise and an
+                # API call.  The route handler rewrites StartDate before
+                # the request leaves the browser.
                 # ----------------------------------------------------------
                 with self._page.expect_response(
                     lambda r: "GetInventoryCountData" in r.url,
                     timeout=30000,
-                ) as initial_resp_info:
+                ) as resp_info:
                     self._page.select_option(
                         "#box-widget_InitialProductSelection",
                         value=initial_value,
                     )
 
-                initial_resp = initial_resp_info.value
+                response = resp_info.value
                 logger.debug(
-                    "Initial API call: status=%s\n  url=%s",
-                    initial_resp.status,
-                    initial_resp.url,
+                    "API response: status=%s", response.status
                 )
 
-                if initial_resp.status != 200:
-                    # Log the response body to understand why the request failed
-                    try:
-                        resp_body = initial_resp.text()[:500]
-                    except Exception:
-                        resp_body = "(could not read body)"
-                    logger.warning(
-                        "Initial API call returned %s (attempt %s/%s)"
-                        "\n  response body: %s",
-                        initial_resp.status,
-                        attempt,
-                        max_attempts,
-                        resp_body,
-                    )
-                    # Check if reCAPTCHA Enterprise is available on the page
-                    recaptcha_state = self._page.evaluate(
-                        """() => {
-                            return {
-                                hasGrecaptcha: typeof grecaptcha !== 'undefined',
-                                hasEnterprise: typeof grecaptcha !== 'undefined'
-                                    && typeof grecaptcha.enterprise !== 'undefined',
-                                scriptTags: [...document.querySelectorAll('script[src*="recaptcha"]')]
-                                    .map(s => s.src),
-                            };
-                        }"""
-                    )
-                    logger.debug(
-                        "reCAPTCHA state: %s", recaptcha_state
-                    )
-                    continue
-
-                # ----------------------------------------------------------
-                # Step 2: Wait for calendar month/year <select> elements.
-                # After property selection the page transitions to a detail
-                # view with a calendar widget.  We wait for the year and
-                # month selects to appear rather than using a fixed timeout.
-                # ----------------------------------------------------------
-                try:
-                    self._page.wait_for_function(
-                        _JS_CALENDAR_READY, timeout=10000
-                    )
-                except Exception:
-                    logger.warning(
-                        "Calendar selects did not appear after property "
-                        "selection (attempt %s/%s)",
-                        attempt,
-                        max_attempts,
-                    )
-                    self._log_page_selects()
-                    continue
-
-                # Read current calendar state so we only change what's needed.
-                cal_state = self._page.evaluate(
-                    """() => {
-                        const selects = [...document.querySelectorAll('select')];
-                        let yearVal = null, monthVal = null;
-                        for (const s of selects) {
-                            if ([...s.options].some(o => /^20\\d{2}$/.test(o.value)))
-                                yearVal = s.value;
-                        }
-                        for (const s of selects) {
-                            const texts = [...s.options].map(o => o.text);
-                            if (texts.some(t =>
-                                ['Jan','Feb','Mar','Apr','May','Jun',
-                                 'Jul','Aug','Sep','Oct','Nov','Dec'].includes(t)
-                            ))
-                                monthVal = s.value;
-                        }
-                        return {yearVal: yearVal, monthVal: monthVal};
-                    }"""
-                )
-                logger.debug(
-                    "Calendar state: year=%s month=%s (target: year=%s month=%s)",
-                    cal_state.get("yearVal"),
-                    cal_state.get("monthVal"),
-                    target_year_val,
-                    target_month_val,
-                )
-
-                # If the default calendar already shows our target, the
-                # initial response has the data we need.
-                if (
-                    cal_state.get("yearVal") == target_year_val
-                    and cal_state.get("monthVal") == target_month_val
-                ):
-                    return self._parse_jsonp(initial_resp.text())
-
-                # ----------------------------------------------------------
-                # Step 3: Navigate the calendar to the target month/year.
-                #
-                # KEY FIX: Use Playwright's select_option() on ElementHandles
-                # instead of JavaScript dispatchEvent(new Event('change')).
-                # Playwright triggers *trusted* native browser events
-                # (isTrusted=true) which framework event handlers (jQuery,
-                # React, Angular) recognise.  The old dispatchEvent approach
-                # created *untrusted* synthetic events that frameworks may
-                # silently ignore, preventing the widget from making the API
-                # call.
-                # ----------------------------------------------------------
-                year_handle = self._page.evaluate_handle(_JS_FIND_YEAR_SELECT)
-                month_handle = self._page.evaluate_handle(_JS_FIND_MONTH_SELECT)
-
-                year_element = year_handle.as_element()
-                month_element = month_handle.as_element()
-
-                if not year_element or not month_element:
-                    logger.warning(
-                        "Could not get element handles for calendar selects "
-                        "(attempt %s/%s)",
-                        attempt,
-                        max_attempts,
-                    )
-                    self._log_page_selects()
-                    continue
-
-                # 3a. Change year first (if needed).
-                # Changing the year may or may not trigger its own API call
-                # (depends on the widget implementation).  If it does, we
-                # consume the response so it doesn't leak into 3b.
-                if cal_state.get("yearVal") != target_year_val:
-                    try:
-                        with self._page.expect_response(
-                            lambda r: "GetInventoryCountData" in r.url,
-                            timeout=10000,
-                        ):
-                            year_element.select_option(value=target_year_val)
-                        logger.debug("Year change triggered an API call (consumed)")
-                    except Exception:
-                        # Year change alone didn't trigger an API call — that's
-                        # fine, the month change will trigger the combined call.
-                        logger.debug(
-                            "Year change did not trigger a separate API call"
-                        )
-
-                # 3b. Change month and capture the response.
-                # This is the response that contains the target month/year data.
-                with self._page.expect_response(
-                    lambda r: "GetInventoryCountData" in r.url,
-                    timeout=30000,
-                ) as target_resp_info:
-                    month_element.select_option(value=target_month_val)
-
-                response = target_resp_info.value
-                logger.debug(
-                    "Calendar API call: status=%s\n  url=%s",
-                    response.status,
-                    response.url,
-                )
                 if response.status != 200:
                     try:
                         resp_body = response.text()[:500]
                     except Exception:
                         resp_body = "(could not read body)"
                     logger.warning(
-                        "Calendar API call returned %s (attempt %s/%s)"
-                        "\n  response body: %s",
+                        "API returned %s (attempt %s/%s)\n  body: %s",
                         response.status,
                         attempt,
                         max_attempts,
@@ -437,7 +267,15 @@ class YosemiteLodging(BaseProvider):
                     continue
 
                 text = response.text()
-                return self._parse_jsonp(text)
+                data = self._parse_jsonp(text)
+                if isinstance(data, list):
+                    logger.debug(
+                        "Got %s inventory items for %s/%s",
+                        len(data),
+                        month,
+                        year,
+                    )
+                return data
 
             except Exception as e:
                 if attempt < max_attempts:
@@ -449,6 +287,13 @@ class YosemiteLodging(BaseProvider):
                     )
                 else:
                     raise
+            finally:
+                # Always clean up the route handler so it doesn't
+                # stack across retries.
+                try:
+                    self._page.unroute("**/GetInventoryCountData*")
+                except Exception:
+                    pass
 
     def _build_booking_url(self, property_code: str) -> str:
         """Build a browser-loadable booking URL for a property."""
