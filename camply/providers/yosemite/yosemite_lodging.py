@@ -326,11 +326,13 @@ class YosemiteLodging(BaseProvider):
         multiprop_code: str,
         checkin_iso: str,
         checkout_iso: str,
-    ) -> list:
+    ) -> List[str]:
         """
-        Perform a full search via form submission to get room-type-level
-        results.  Fills the search form and clicks CHECK AVAILABILITY,
-        then captures the resulting network responses and page content.
+        Perform a full search via form submission to get room type names.
+
+        Fills the search form (property + dates), clicks CHECK
+        AVAILABILITY, waits for the results page, and extracts room
+        type names from the HTML.
 
         Parameters
         ----------
@@ -343,8 +345,10 @@ class YosemiteLodging(BaseProvider):
 
         Returns
         -------
-        list
-            List of dicts with room type info
+        List[str]
+            List of room type names (e.g., ['Heated Canvas Tent Cabin
+            - 1 Double Bed', 'Unheated Canvas Tent Cabin - 1 Double
+            Bed', ...])
         """
         self._ensure_browser()
 
@@ -368,95 +372,103 @@ class YosemiteLodging(BaseProvider):
         self._page.wait_for_timeout(2000)
 
         # Fill dates via the native date inputs (type="date", ISO format)
-        # These are the actual form fields the widget uses.
         self._page.fill("#box-widget_ArrivalDate_nd", checkin_iso)
         self._page.fill("#box-widget_DepartureDate_nd", checkout_iso)
         logger.debug(
-            "Filled dates: checkin=%s checkout=%s",
+            "Form search: %s checkin=%s checkout=%s",
+            multiprop_code,
             checkin_iso,
             checkout_iso,
         )
 
-        # Wait a moment for the form to validate dates
         self._page.wait_for_timeout(1000)
 
-        # Click the non-disabled CHECK AVAILABILITY submit button.
-        # There are two on the page — the first is disabled (initial
-        # form), the second is the real one (after property selection).
+        # Click the non-disabled CHECK AVAILABILITY submit button
         button = self._page.query_selector(
             "input[type='submit'][value='Check Availability']:not([disabled])"
         )
         if not button:
-            logger.warning(
-                "No enabled CHECK AVAILABILITY button found — "
-                "trying force-click on any submit"
-            )
-            button = self._page.query_selector(
-                "input[type='submit'][value='Check Availability']"
-            )
-            if button:
-                button.click(force=True)
-            else:
-                logger.warning("No CHECK AVAILABILITY button found at all")
-                return []
-        else:
-            logger.debug("Found enabled CHECK AVAILABILITY button")
+            logger.warning("No enabled CHECK AVAILABILITY button found")
+            return []
 
-        # Capture all network responses during the search
-        captured_responses = []
-
-        def _capture_search_responses(response):
-            url = response.url
-            if any(
-                kw in url
-                for kw in [
-                    "Search", "Availability", "Result",
-                    "UnitType", "Room", "Inventory",
-                    "Accommodation",
-                ]
-            ):
-                try:
-                    body = response.text()[:3000]
-                except Exception:
-                    body = "(could not read)"
-                captured_responses.append({
-                    "url": url[:300],
-                    "status": response.status,
-                    "body_preview": body[:1500],
-                })
-                logger.debug(
-                    "Search response: status=%s url=%s\n  body: %s",
-                    response.status,
-                    url[:300],
-                    body[:1500],
-                )
-
-        self._page.on("response", _capture_search_responses)
-
-        logger.debug("Clicking CHECK AVAILABILITY...")
         button.click()
 
-        # Wait for navigation or network activity
+        # Wait for navigation to the results page
         try:
             self._page.wait_for_load_state("networkidle", timeout=30000)
         except Exception:
             pass
+        self._page.wait_for_timeout(2000)
 
-        self._page.wait_for_timeout(3000)
+        # Extract room type names from the results page.
+        # The results page shows room cards with <h3> or bold names.
+        # Try several selectors that might match the room type headings.
+        room_types = []
 
-        logger.debug(
-            "After search: URL=%s, captured %s responses",
-            self._page.url[:300],
-            len(captured_responses),
-        )
+        # Try common patterns for room type cards
+        for selector in [
+            ".unit-type-name",
+            ".room-name",
+            ".result-item h3",
+            ".search-result h3",
+            "h3.unit-name",
+            ".product-title",
+            ".wxa-search-result-unit-name",
+        ]:
+            elements = self._page.query_selector_all(selector)
+            if elements:
+                room_types = [
+                    el.inner_text().strip() for el in elements
+                    if el.inner_text().strip()
+                ]
+                logger.debug(
+                    "Found %s room types via '%s': %s",
+                    len(room_types),
+                    selector,
+                    room_types,
+                )
+                break
 
-        # Log the resulting page text to see room type cards
-        result_text = self._page.inner_text("body")[:5000]
-        logger.debug(
-            "Results page text (first 5000 chars):\n%s", result_text
-        )
+        # Fallback: parse room type names from page text using patterns
+        if not room_types:
+            page_text = self._page.inner_text("body")
+            logger.debug(
+                "No room types found via selectors, parsing page text "
+                "(first 3000 chars):\n%s",
+                page_text[:3000],
+            )
+            # Look for "Showing X to Y of Z" to confirm results exist
+            showing_match = re.search(
+                r"Showing \d+ to \d+ of (\d+)", page_text
+            )
+            if showing_match:
+                logger.debug(
+                    "Results page shows %s results", showing_match.group(1)
+                )
 
-        return captured_responses
+            # Try to extract room names from the HTML directly
+            # Room cards typically have bold headings
+            html = self._page.content()
+            # Look for h-tags or strong tags that contain room type names
+            heading_matches = re.findall(
+                r"<(?:h[2-4]|strong)[^>]*>\s*([^<]+(?:Cabin|Room|Suite|"
+                r"Lodge|Camp|Tent|Cottage|Bungalow|House)[^<]*)\s*"
+                r"</(?:h[2-4]|strong)>",
+                html,
+                re.IGNORECASE,
+            )
+            if heading_matches:
+                room_types = [m.strip() for m in heading_matches]
+                logger.debug(
+                    "Found %s room types via HTML parsing: %s",
+                    len(room_types),
+                    room_types,
+                )
+
+        if not room_types:
+            logger.debug("Could not find room type names on results page")
+
+        return room_types
 
     def _build_booking_url(self, property_code: str) -> str:
         """Build a browser-loadable booking URL for a property."""
@@ -531,34 +543,98 @@ class YosemiteLodging(BaseProvider):
                 f"{len(available_dates)} available dates found for {prop_name}."
             )
 
-            booking_url = self._build_booking_url(prop_code)
+            # Filter to dates in our search window
+            window_dates = []
             for item in available_dates:
                 date_str = item["DateKey"]
-                booking_date = datetime.strptime(date_str, "%Y-%m-%d")
-                # Skip dates outside our actual range
-                if booking_date.date() < start_date or booking_date.date() > end_date:
-                    continue
-                booking_end = booking_date + timedelta(days=booking_nights)
-                campsite = AvailableCampsite(
-                    campsite_id=f"{prop_code}_{date_str}",
-                    booking_date=booking_date,
-                    booking_end_date=booking_end,
-                    booking_nights=booking_nights,
-                    campsite_site_name=prop_name,
-                    campsite_loop_name=YosemiteConfig.YOSEMITE_LOOP_NAME,
-                    campsite_type="LODGING",
-                    campsite_occupancy=(1, 6),
-                    campsite_use_type="Overnight",
-                    availability_status=YosemiteConfig.CAMPSITE_AVAILABILITY_STATUS,
-                    recreation_area=YosemiteConfig.YOSEMITE_RECREATION_AREA_NAME,
-                    recreation_area_id=YosemiteConfig.YOSEMITE_RECREATION_AREA_ID,
-                    facility_name=prop_name,
-                    facility_id=prop_code,
-                    booking_url=booking_url,
-                    permitted_equipment=None,
-                    campsite_attributes=None,
+                d = datetime.strptime(date_str, "%Y-%m-%d").date()
+                if start_date <= d <= end_date:
+                    window_dates.append(d)
+
+            if not window_dates:
+                continue
+
+            # For the first available date in the window, do a form
+            # search to discover room type names. Room types are the
+            # same for a property regardless of date, so one lookup
+            # is enough.
+            room_types = []
+            first_date = window_dates[0]
+            checkout_d = first_date + timedelta(days=booking_nights)
+            try:
+                room_types = self._search_room_types(
+                    multiprop_code=prop_code,
+                    checkin_iso=first_date.isoformat(),
+                    checkout_iso=checkout_d.isoformat(),
                 )
-                all_campsites.append(campsite)
+            except Exception as e:
+                logger.warning(
+                    "Room type search failed for %s: %s", prop_name, e
+                )
+
+            # If we got room types, create one campsite per room type
+            # per date.  Otherwise fall back to one per date.
+            booking_url = self._build_booking_url(prop_code)
+            if room_types:
+                for d in window_dates:
+                    for room_name in room_types:
+                        date_str = d.isoformat()
+                        booking_date = datetime.combine(
+                            d, datetime.min.time()
+                        )
+                        booking_end = booking_date + timedelta(
+                            days=booking_nights
+                        )
+                        campsite = AvailableCampsite(
+                            campsite_id=f"{prop_code}_{date_str}_{room_name}",
+                            booking_date=booking_date,
+                            booking_end_date=booking_end,
+                            booking_nights=booking_nights,
+                            campsite_site_name=room_name,
+                            campsite_loop_name=prop_name,
+                            campsite_type="LODGING",
+                            campsite_occupancy=(1, 6),
+                            campsite_use_type="Overnight",
+                            availability_status=YosemiteConfig.CAMPSITE_AVAILABILITY_STATUS,
+                            recreation_area=YosemiteConfig.YOSEMITE_RECREATION_AREA_NAME,
+                            recreation_area_id=YosemiteConfig.YOSEMITE_RECREATION_AREA_ID,
+                            facility_name=prop_name,
+                            facility_id=prop_code,
+                            booking_url=booking_url,
+                            permitted_equipment=None,
+                            campsite_attributes=None,
+                        )
+                        all_campsites.append(campsite)
+            else:
+                # Fallback: one campsite per date (no room type detail)
+                for d in window_dates:
+                    date_str = d.isoformat()
+                    booking_date = datetime.combine(
+                        d, datetime.min.time()
+                    )
+                    booking_end = booking_date + timedelta(
+                        days=booking_nights
+                    )
+                    campsite = AvailableCampsite(
+                        campsite_id=f"{prop_code}_{date_str}",
+                        booking_date=booking_date,
+                        booking_end_date=booking_end,
+                        booking_nights=booking_nights,
+                        campsite_site_name=prop_name,
+                        campsite_loop_name=YosemiteConfig.YOSEMITE_LOOP_NAME,
+                        campsite_type="LODGING",
+                        campsite_occupancy=(1, 6),
+                        campsite_use_type="Overnight",
+                        availability_status=YosemiteConfig.CAMPSITE_AVAILABILITY_STATUS,
+                        recreation_area=YosemiteConfig.YOSEMITE_RECREATION_AREA_NAME,
+                        recreation_area_id=YosemiteConfig.YOSEMITE_RECREATION_AREA_ID,
+                        facility_name=prop_name,
+                        facility_id=prop_code,
+                        booking_url=booking_url,
+                        permitted_equipment=None,
+                        campsite_attributes=None,
+                    )
+                    all_campsites.append(campsite)
 
         return all_campsites
 
