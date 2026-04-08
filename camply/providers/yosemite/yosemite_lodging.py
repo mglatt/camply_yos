@@ -84,9 +84,9 @@ class YosemiteLodging(BaseProvider):
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
         self._page.goto(YosemiteConfig.SEARCH_PAGE_URL, wait_until="networkidle")
-        # Wait for the search widget to be ready
+        # Wait for the visible search widget to be ready
         self._page.wait_for_selector(
-            "#box-widget_ProductSelection", timeout=30000
+            "#box-widget_InitialProductSelection", timeout=30000
         )
         logger.info("Browser ready - search page loaded.")
         self._browser_ready = True
@@ -122,8 +122,12 @@ class YosemiteLodging(BaseProvider):
         year: int,
     ) -> list:
         """
-        Get inventory count by selecting a property and month in the
-        page's calendar widget, then intercepting the API response.
+        Get inventory count by selecting a property in the page's
+        InitialProductSelection dropdown, then intercepting the
+        GetInventoryCountData API response.
+
+        The page handles reCAPTCHA Enterprise internally when the
+        dropdown triggers the calendar widget search.
 
         Parameters
         ----------
@@ -140,59 +144,23 @@ class YosemiteLodging(BaseProvider):
             List of dicts with 'DateKey' and 'AvailableCount'
         """
         self._ensure_browser()
-        target_month_val = str(month - 1)  # Page uses 0-indexed months
-        target_year_val = str(year)
 
-        # First, set the property dropdown (without triggering change yet)
-        self._page.evaluate(
-            """([propCode, monthVal, yearVal]) => {
-                // Set property
-                const propSelect = document.getElementById('box-widget_ProductSelection');
-                if (propSelect) propSelect.value = propCode;
+        # InitialProductSelection uses "2:X" format (rec area ID : prop code)
+        initial_value = f"{YosemiteConfig.YOSEMITE_RECREATION_AREA_ID}:{multiprop_code}"
 
-                // Find and set year selector (unnamed select with year options)
-                const allSelects = [...document.querySelectorAll('select:not([id])')];
-                for (const sel of allSelects) {
-                    const vals = [...sel.options].map(o => o.value);
-                    if (vals.includes('2026') || vals.includes('2027')) {
-                        sel.value = yearVal;
-                        sel.dispatchEvent(new Event('change', {bubbles: true}));
-                        break;
-                    }
-                }
-
-                // Find and set month selector (unnamed select with month abbreviations)
-                for (const sel of allSelects) {
-                    const texts = [...sel.options].map(o => o.text);
-                    if (texts.some(t => ['Jan','Feb','Mar','Apr','May','Jun',
-                                         'Jul','Aug','Sep','Oct','Nov','Dec'].includes(t))) {
-                        sel.value = monthVal;
-                        sel.dispatchEvent(new Event('change', {bubbles: true}));
-                        break;
-                    }
-                }
-            }""",
-            [multiprop_code, target_month_val, target_year_val],
+        # First, reset to the placeholder to ensure a change event fires
+        self._page.select_option(
+            "#box-widget_InitialProductSelection", value=""
         )
+        self._page.wait_for_timeout(300)
 
-        # Small delay to let year/month changes settle
-        self._page.wait_for_timeout(500)
-
-        # Now trigger the property change and wait for the API response
+        # Select the property and wait for the API response
         with self._page.expect_response(
             lambda r: "GetInventoryCountData" in r.url and r.status == 200,
             timeout=30000,
         ) as response_info:
-            # Trigger property change which fires the calendar refresh + API call
-            self._page.evaluate(
-                """(propCode) => {
-                    const propSelect = document.getElementById('box-widget_ProductSelection');
-                    if (propSelect) {
-                        propSelect.value = propCode;
-                        propSelect.dispatchEvent(new Event('change', {bubbles: true}));
-                    }
-                }""",
-                multiprop_code,
+            self._page.select_option(
+                "#box-widget_InitialProductSelection", value=initial_value
             )
 
         response = response_info.value
