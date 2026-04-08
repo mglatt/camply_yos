@@ -45,6 +45,8 @@ class YosemiteLodging(BaseProvider):
         self._browser = None
         self._page = None
         self._browser_cookies_synced = False
+        self._recaptcha_ready = False
+        self._use_enterprise = False
         self.session.headers.update(
             {
                 "Accept": "text/javascript, application/javascript, "
@@ -60,8 +62,11 @@ class YosemiteLodging(BaseProvider):
         Launch headless browser and navigate to the search page
         so that reCAPTCHA v3 is loaded and ready to generate tokens.
         """
-        if self._page is not None:
+        if self._page is not None and self._recaptcha_ready:
             return
+        # Clean up any broken previous state
+        if self._page is not None:
+            self._close_browser()
         try:
             from playwright.sync_api import sync_playwright
         except ImportError:
@@ -72,18 +77,40 @@ class YosemiteLodging(BaseProvider):
             )
         logger.info("Launching headless browser for reCAPTCHA token generation...")
         self._playwright = sync_playwright().start()
-        self._browser = self._playwright.chromium.launch(headless=True)
+        self._browser = self._playwright.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+            ],
+        )
         context = self._browser.new_context(
             user_agent=self.session.headers.get("User-Agent", ""),
         )
         self._page = context.new_page()
-        self._page.goto(YosemiteConfig.SEARCH_PAGE_URL, wait_until="networkidle")
-        # Wait for reCAPTCHA to be ready
-        self._page.wait_for_function(
-            "typeof grecaptcha !== 'undefined' && typeof grecaptcha.execute === 'function'",
-            timeout=30000,
+        # Hide webdriver flag to avoid headless detection
+        self._page.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
-        logger.info("Browser ready - reCAPTCHA loaded.")
+        self._page.goto(YosemiteConfig.SEARCH_PAGE_URL, wait_until="networkidle")
+        # Wait for reCAPTCHA — handle both standard and enterprise APIs
+        self._page.wait_for_function(
+            """() => {
+                if (typeof grecaptcha !== 'undefined') {
+                    if (typeof grecaptcha.execute === 'function') return true;
+                    if (grecaptcha.enterprise && typeof grecaptcha.enterprise.execute === 'function') return true;
+                }
+                return false;
+            }""",
+            timeout=60000,
+        )
+        # Detect which API variant is available
+        self._use_enterprise = self._page.evaluate(
+            "typeof grecaptcha.enterprise !== 'undefined' "
+            "&& typeof grecaptcha.enterprise.execute === 'function'"
+        )
+        api_type = "enterprise" if self._use_enterprise else "standard"
+        logger.info(f"Browser ready - reCAPTCHA loaded ({api_type} API).")
+        self._recaptcha_ready = True
 
     def _get_recaptcha_token(self) -> str:
         """
@@ -91,10 +118,15 @@ class YosemiteLodging(BaseProvider):
         Tokens are single-use and expire in ~2 minutes.
         """
         self._ensure_browser()
-        token = self._page.evaluate(
-            f"grecaptcha.execute('{YosemiteConfig.RECAPTCHA_SITE_KEY}', "
-            f"{{action: 'submit'}})"
-        )
+        site_key = YosemiteConfig.RECAPTCHA_SITE_KEY
+        if self._use_enterprise:
+            token = self._page.evaluate(
+                f"grecaptcha.enterprise.execute('{site_key}', {{action: 'submit'}})"
+            )
+        else:
+            token = self._page.evaluate(
+                f"grecaptcha.execute('{site_key}', {{action: 'submit'}})"
+            )
         return token
 
     def _sync_browser_cookies(self) -> None:
@@ -124,6 +156,7 @@ class YosemiteLodging(BaseProvider):
             self._playwright = None
         self._page = None
         self._browser_cookies_synced = False
+        self._recaptcha_ready = False
 
     def __del__(self):
         self._close_browser()

@@ -23,7 +23,7 @@ import click
 from rich import traceback
 from rich_click import RichCommand, RichGroup, rich_click
 
-from camply import Yellowstone, __application__, __version__
+from camply import Yellowstone, YosemiteLodging, __application__, __version__
 from camply.config import EquipmentOptions, SearchConfig, logging_config
 from camply.config.logging_config import set_up_logging
 from camply.containers import SearchWindow
@@ -270,7 +270,7 @@ def recreation_areas(
         [
             search is None,
             state is not None,
-            provider in [Yellowstone.__name__, GoingToCamp.__name__],
+            provider in [Yellowstone.__name__, GoingToCamp.__name__, YosemiteLodging.__name__],
         ]
     ):
         # State Filtering Not Supported
@@ -328,7 +328,7 @@ def campgrounds(
             len(rec_area) == 0,
             len(campground) == 0,
             len(campsite) == 0,
-            provider not in [Yellowstone.__name__, GoingToCamp.__name__],
+            provider not in [Yellowstone.__name__, GoingToCamp.__name__, YosemiteLodging.__name__],
         ]
     ):
         logger.error(
