@@ -145,30 +145,48 @@ class YosemiteLodging(BaseProvider):
         """
         self._ensure_browser()
 
-        # Reload the page to reset to the landing state where
-        # InitialProductSelection is visible. Selecting from it
-        # triggers the calendar widget + reCAPTCHA + API call.
-        self._page.goto(
-            YosemiteConfig.SEARCH_PAGE_URL, wait_until="networkidle"
-        )
-        self._page.wait_for_selector(
-            "#box-widget_InitialProductSelection", timeout=30000
-        )
-
+        max_attempts = 3
         initial_value = (
             f"{YosemiteConfig.YOSEMITE_RECREATION_AREA_ID}:{multiprop_code}"
         )
-        with self._page.expect_response(
-            lambda r: "GetInventoryCountData" in r.url and r.status == 200,
-            timeout=30000,
-        ) as response_info:
-            self._page.select_option(
-                "#box-widget_InitialProductSelection", value=initial_value
+
+        for attempt in range(1, max_attempts + 1):
+            # Reload the page to reset to the landing state where
+            # InitialProductSelection is visible.
+            self._page.goto(
+                YosemiteConfig.SEARCH_PAGE_URL, wait_until="networkidle"
+            )
+            self._page.wait_for_selector(
+                "#box-widget_InitialProductSelection", timeout=30000
             )
 
-        response = response_info.value
-        text = response.text()
-        return self._parse_jsonp(text)
+            try:
+                with self._page.expect_response(
+                    lambda r: "GetInventoryCountData" in r.url,
+                    timeout=30000,
+                ) as response_info:
+                    self._page.select_option(
+                        "#box-widget_InitialProductSelection",
+                        value=initial_value,
+                    )
+
+                response = response_info.value
+                if response.status != 200:
+                    logger.warning(
+                        f"API returned {response.status} on attempt "
+                        f"{attempt}/{max_attempts}"
+                    )
+                    continue
+                text = response.text()
+                return self._parse_jsonp(text)
+
+            except Exception as e:
+                if attempt < max_attempts:
+                    logger.info(
+                        f"Attempt {attempt}/{max_attempts} failed, retrying..."
+                    )
+                else:
+                    raise
 
     def _build_booking_url(self, property_code: str) -> str:
         """Build a browser-loadable booking URL for a property."""
