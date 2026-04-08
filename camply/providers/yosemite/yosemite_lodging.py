@@ -4,7 +4,11 @@ Yosemite National Park Lodging Provider
 Uses the Aramark/AHLS booking system at reservations.ahlsmsworld.com
 to check availability for Yosemite lodging properties.
 
-Requires Playwright for reCAPTCHA token generation and API calls:
+Automates the search page via Playwright — selects properties and months
+in the calendar widget, and intercepts the GetInventoryCountData API
+responses. This lets the page handle reCAPTCHA Enterprise internally.
+
+Requires Playwright:
     pip install playwright && python -m playwright install chromium
 """
 
@@ -31,8 +35,8 @@ class YosemiteLodging(BaseProvider):
     at Yosemite lodging properties (Curry Village, Housekeeping Camp,
     The Ahwahnee, Tuolumne Meadows Lodge, Yosemite Valley Lodge).
 
-    All API calls run inside a headless browser to handle reCAPTCHA
-    Enterprise token generation natively.
+    Uses Playwright to automate the search page UI and intercept
+    API responses, letting the page handle reCAPTCHA Enterprise natively.
     """
 
     recreation_area = RecreationArea(
@@ -46,16 +50,14 @@ class YosemiteLodging(BaseProvider):
         self._playwright = None
         self._browser = None
         self._page = None
-        self._recaptcha_ready = False
+        self._browser_ready = False
 
     def _ensure_browser(self) -> None:
         """
-        Launch headless browser and navigate to the search page
-        so that reCAPTCHA is loaded and ready to generate tokens.
+        Launch headless browser and navigate to the search page.
         """
-        if self._page is not None and self._recaptcha_ready:
+        if self._page is not None and self._browser_ready:
             return
-        # Clean up any broken previous state
         if self._page is not None:
             self._close_browser()
         try:
@@ -66,7 +68,7 @@ class YosemiteLodging(BaseProvider):
                 "Install it with: pip install playwright && "
                 "python -m playwright install chromium"
             )
-        logger.info("Launching headless browser for reCAPTCHA token generation...")
+        logger.info("Launching headless browser for Yosemite search...")
         self._playwright = sync_playwright().start()
         self._browser = self._playwright.chromium.launch(
             headless=True,
@@ -78,48 +80,16 @@ class YosemiteLodging(BaseProvider):
             user_agent=self.session.headers.get("User-Agent", ""),
         )
         self._page = context.new_page()
-        # Hide webdriver flag to avoid headless detection
         self._page.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
         self._page.goto(YosemiteConfig.SEARCH_PAGE_URL, wait_until="networkidle")
-        # Wait for reCAPTCHA — handle both standard and enterprise APIs
-        self._page.wait_for_function(
-            """() => {
-                if (typeof grecaptcha !== 'undefined') {
-                    if (typeof grecaptcha.execute === 'function') return true;
-                    if (grecaptcha.enterprise && typeof grecaptcha.enterprise.execute === 'function') return true;
-                }
-                return false;
-            }""",
-            timeout=60000,
+        # Wait for the search widget to be ready
+        self._page.wait_for_selector(
+            "#box-widget_ProductSelection", timeout=30000
         )
-        # Extract the reCAPTCHA action string from the page's own JavaScript
-        self._page.evaluate(
-            """() => {
-                // Monkeypatch execute to capture the action string the page uses
-                window.__capturedRecaptchaAction = null;
-                window.__capturedRecaptchaSiteKey = null;
-                const patchExec = (obj, name) => {
-                    const orig = obj[name].bind(obj);
-                    obj[name] = function(siteKey, options) {
-                        window.__capturedRecaptchaSiteKey = siteKey;
-                        if (options && options.action) {
-                            window.__capturedRecaptchaAction = options.action;
-                        }
-                        return orig(siteKey, options);
-                    };
-                };
-                if (typeof grecaptcha.enterprise !== 'undefined' &&
-                    typeof grecaptcha.enterprise.execute === 'function') {
-                    patchExec(grecaptcha.enterprise, 'execute');
-                } else if (typeof grecaptcha.execute === 'function') {
-                    patchExec(grecaptcha, 'execute');
-                }
-            }"""
-        )
-        logger.info("Browser ready - reCAPTCHA loaded.")
-        self._recaptcha_ready = True
+        logger.info("Browser ready - search page loaded.")
+        self._browser_ready = True
 
     def _close_browser(self) -> None:
         """Clean up browser resources."""
@@ -130,7 +100,7 @@ class YosemiteLodging(BaseProvider):
             self._playwright.stop()
             self._playwright = None
         self._page = None
-        self._recaptcha_ready = False
+        self._browser_ready = False
 
     def __del__(self):
         self._close_browser()
@@ -139,49 +109,30 @@ class YosemiteLodging(BaseProvider):
     def _parse_jsonp(text: str) -> object:
         """
         Strip JSONP callback wrapper and parse the JSON payload.
-
-        Handles both named callbacks like:
-            callbackName([{...}])
-        and jQuery-style:
-            jQuery123456_789({...})
         """
         match = re.match(r"^[^(\[{]+\((.+)\);?\s*$", text, re.DOTALL)
         if match:
             return json.loads(match.group(1))
         return json.loads(text)
 
-    @staticmethod
-    def _format_date_for_api(dt: datetime) -> str:
-        """
-        Format a date for the GetInventoryCountData API.
-
-        The API expects dates like: 'Fri May 01 2026'
-        (JavaScript Date toString-style format)
-        """
-        return dt.strftime("%a %b %d %Y")
-
     def _get_inventory_count(
         self,
         multiprop_code: str,
-        start_date: datetime,
-        end_date: datetime,
+        month: int,
+        year: int,
     ) -> list:
         """
-        Call the GetInventoryCountData API from inside the browser context.
-
-        This makes the fetch call from the same browser session that loaded
-        reCAPTCHA, so token generation, cookies, and headers are all handled
-        natively by the browser — no need to sync cookies or pass tokens
-        through an external HTTP client.
+        Get inventory count by selecting a property and month in the
+        page's calendar widget, then intercepting the API response.
 
         Parameters
         ----------
         multiprop_code: str
             Property code (e.g., 'H' for Housekeeping Camp)
-        start_date: datetime
-            Start of date range
-        end_date: datetime
-            End of date range
+        month: int
+            Month number (1-12)
+        year: int
+            Year (e.g., 2026)
 
         Returns
         -------
@@ -189,77 +140,64 @@ class YosemiteLodging(BaseProvider):
             List of dicts with 'DateKey' and 'AvailableCount'
         """
         self._ensure_browser()
-        start_str = self._format_date_for_api(start_date)
-        end_str = self._format_date_for_api(end_date)
+        target_month_val = str(month - 1)  # Page uses 0-indexed months
+        target_year_val = str(year)
 
-        result = self._page.evaluate(
-            """async ([multiPropCode, cresPropCode, startDate, endDate, searchPath, fallbackSiteKey, fallbackAction]) => {
-                // Determine which execute function to use
-                const isEnterprise = (typeof grecaptcha.enterprise !== 'undefined' &&
-                    typeof grecaptcha.enterprise.execute === 'function');
-                const execFn = isEnterprise
-                    ? grecaptcha.enterprise.execute.bind(grecaptcha.enterprise)
-                    : grecaptcha.execute.bind(grecaptcha);
+        # First, set the property dropdown (without triggering change yet)
+        self._page.evaluate(
+            """([propCode, monthVal, yearVal]) => {
+                // Set property
+                const propSelect = document.getElementById('box-widget_ProductSelection');
+                if (propSelect) propSelect.value = propCode;
 
-                // Extract site key from the recaptcha script tag
-                let siteKey = null;
-                const scripts = document.querySelectorAll('script[src*="recaptcha"]');
-                for (const s of scripts) {
-                    const m = s.src.match(/[?&]render=([^&]+)/);
-                    if (m && m[1] !== 'explicit') { siteKey = m[1]; break; }
-                }
-                if (!siteKey) {
-                    const el = document.querySelector('[data-sitekey]');
-                    if (el) siteKey = el.getAttribute('data-sitekey');
-                }
-                if (!siteKey) siteKey = fallbackSiteKey;
-
-                // Use captured action if available, otherwise use known action
-                const action = window.__capturedRecaptchaAction || fallbackAction;
-
-                // Generate token
-                const token = await execFn(siteKey, {action: action});
-
-                // Build the API URL
-                const params = new URLSearchParams({
-                    CresPropCode: cresPropCode,
-                    MultiPropCode: multiPropCode,
-                    UnitTypeCode: '',
-                    StartDate: startDate,
-                    EndDate: endDate,
-                    RecaptchaToken: token,
-                    _: Date.now().toString()
-                });
-
-                const response = await fetch(searchPath + '?' + params.toString(), {
-                    headers: {
-                        'X-Requested-With': 'XMLHttpRequest',
-                        'Accept': 'application/json, text/javascript, */*; q=0.01'
+                // Find and set year selector (unnamed select with year options)
+                const allSelects = [...document.querySelectorAll('select:not([id])')];
+                for (const sel of allSelects) {
+                    const vals = [...sel.options].map(o => o.value);
+                    if (vals.includes('2026') || vals.includes('2027')) {
+                        sel.value = yearVal;
+                        sel.dispatchEvent(new Event('change', {bubbles: true}));
+                        break;
                     }
-                });
-
-                if (!response.ok) {
-                    const body = await response.text().catch(() => '');
-                    throw new Error('HTTP ' + response.status + ': ' + response.statusText + ' - ' + body.substring(0, 200));
                 }
 
-                const text = await response.text();
-                // Parse JSONP wrapper if present
-                const match = text.match(/^[^(\\[{]+\\((.+)\\);?\\s*$/s);
-                if (match) return JSON.parse(match[1]);
-                return JSON.parse(text);
+                // Find and set month selector (unnamed select with month abbreviations)
+                for (const sel of allSelects) {
+                    const texts = [...sel.options].map(o => o.text);
+                    if (texts.some(t => ['Jan','Feb','Mar','Apr','May','Jun',
+                                         'Jul','Aug','Sep','Oct','Nov','Dec'].includes(t))) {
+                        sel.value = monthVal;
+                        sel.dispatchEvent(new Event('change', {bubbles: true}));
+                        break;
+                    }
+                }
             }""",
-            [
-                multiprop_code,
-                YosemiteConfig.CRES_PROP_CODE,
-                start_str,
-                end_str,
-                YosemiteConfig.API_SEARCH_PATH,
-                YosemiteConfig.RECAPTCHA_SITE_KEY,
-                YosemiteConfig.RECAPTCHA_ACTION,
-            ],
+            [multiprop_code, target_month_val, target_year_val],
         )
-        return result
+
+        # Small delay to let year/month changes settle
+        self._page.wait_for_timeout(500)
+
+        # Now trigger the property change and wait for the API response
+        with self._page.expect_response(
+            lambda r: "GetInventoryCountData" in r.url and r.status == 200,
+            timeout=30000,
+        ) as response_info:
+            # Trigger property change which fires the calendar refresh + API call
+            self._page.evaluate(
+                """(propCode) => {
+                    const propSelect = document.getElementById('box-widget_ProductSelection');
+                    if (propSelect) {
+                        propSelect.value = propCode;
+                        propSelect.dispatchEvent(new Event('change', {bubbles: true}));
+                    }
+                }""",
+                multiprop_code,
+            )
+
+        response = response_info.value
+        text = response.text()
+        return self._parse_jsonp(text)
 
     def _build_booking_url(self, property_code: str) -> str:
         """Build a browser-loadable booking URL for a property."""
@@ -303,8 +241,8 @@ class YosemiteLodging(BaseProvider):
             try:
                 inventory = self._get_inventory_count(
                     multiprop_code=prop_code,
-                    start_date=start_date,
-                    end_date=end_date,
+                    month=start_date.month,
+                    year=start_date.year,
                 )
             except Exception as e:
                 logger.warning(
@@ -327,6 +265,9 @@ class YosemiteLodging(BaseProvider):
             for item in available_dates:
                 date_str = item["DateKey"]
                 booking_date = datetime.strptime(date_str, "%Y-%m-%d")
+                # Skip dates outside our actual range
+                if booking_date.date() < start_date or booking_date.date() > end_date:
+                    continue
                 booking_end = booking_date + timedelta(days=booking_nights)
                 campsite = AvailableCampsite(
                     campsite_id=f"{prop_code}_{date_str}",
