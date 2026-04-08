@@ -198,90 +198,158 @@ class YosemiteLodging(BaseProvider):
 
             try:
                 # ----------------------------------------------------------
-                # Set up route interception to rewrite the StartDate
-                # parameter in the outgoing GetInventoryCountData request.
-                # The widget fires this request automatically when a
-                # property is selected; we just swap the date.
+                # Phase A: Passthrough — let the original request go
+                # unmodified so we can confirm the API works at all and
+                # capture the full original URL for comparison.
                 # ----------------------------------------------------------
-                def _rewrite_start_date(route):
+                captured_url = {}
+
+                def _log_passthrough(route):
                     url = route.request.url
-                    if "GetInventoryCountData" not in url:
-                        route.continue_()
-                        return
+                    if "GetInventoryCountData" in url:
+                        captured_url["original"] = url
+                        logger.debug("Passthrough request URL:\n  %s", url)
+                    route.continue_()
 
-                    # Surgical regex replacement of just the StartDate
-                    # value.  Avoids parse_qs/urlencode round-trip which
-                    # can corrupt the JSONP callback ($) or reCAPTCHA
-                    # token encoding.
-                    match = re.search(r"(StartDate=)([^&]*)", url)
-                    if match:
-                        original_encoded = match.group(2)
-                        target_encoded = quote_plus(target_date_str)
-                        new_url = (
-                            url[: match.start(2)]
-                            + target_encoded
-                            + url[match.end(2) :]
-                        )
-                        logger.debug(
-                            "Rewrote StartDate: %s -> %s",
-                            original_encoded[:30],
-                            target_encoded[:30],
-                        )
-                        route.continue_(url=new_url)
-                    else:
-                        logger.debug(
-                            "No StartDate param found in API URL, "
-                            "forwarding unmodified"
-                        )
-                        route.continue_()
+                self._page.route("**/*", _log_passthrough)
 
-                self._page.route(
-                    "**/GetInventoryCountData*", _rewrite_start_date
-                )
-
-                # ----------------------------------------------------------
-                # Select property — triggers reCAPTCHA Enterprise and an
-                # API call.  The route handler rewrites StartDate before
-                # the request leaves the browser.
-                # ----------------------------------------------------------
                 with self._page.expect_response(
                     lambda r: "GetInventoryCountData" in r.url,
                     timeout=30000,
-                ) as resp_info:
+                ) as passthrough_info:
                     self._page.select_option(
                         "#box-widget_InitialProductSelection",
                         value=initial_value,
                     )
 
-                response = resp_info.value
+                self._page.unroute("**/*")
+                passthrough_resp = passthrough_info.value
+
                 logger.debug(
-                    "API response: status=%s", response.status
+                    "Passthrough response: status=%s",
+                    passthrough_resp.status,
                 )
 
-                if response.status != 200:
+                if passthrough_resp.status == 200:
+                    # The unmodified request succeeded.  Parse the
+                    # original StartDate so we can see what month the
+                    # widget defaulted to.
+                    orig_match = re.search(
+                        r"StartDate=([^&]*)",
+                        captured_url.get("original", ""),
+                    )
+                    orig_date = orig_match.group(1) if orig_match else "?"
+                    logger.info(
+                        "Passthrough OK (default StartDate=%s)", orig_date
+                    )
+
+                    # Check if we even need to rewrite — does the
+                    # default month already match our target?
+                    passthrough_text = passthrough_resp.text()
+                    passthrough_data = self._parse_jsonp(passthrough_text)
+                    if isinstance(passthrough_data, list) and passthrough_data:
+                        first_key = passthrough_data[0].get("DateKey", "")
+                        # DateKey is "YYYY-MM-DD"; check month/year
+                        if first_key.startswith(f"{year}-{month:02d}"):
+                            logger.debug(
+                                "Passthrough data already matches "
+                                "target month — using it directly"
+                            )
+                            return passthrough_data
+
+                    # -------------------------------------------------------
+                    # Phase B: Rewrite — now that we know the API works,
+                    # reload and intercept with our target StartDate.
+                    # -------------------------------------------------------
+                    self._page.goto(
+                        YosemiteConfig.SEARCH_PAGE_URL,
+                        wait_until="networkidle",
+                    )
+                    self._page.wait_for_selector(
+                        "#box-widget_InitialProductSelection", timeout=30000
+                    )
+
+                    def _rewrite_start_date(route):
+                        url = route.request.url
+                        if "GetInventoryCountData" not in url:
+                            route.continue_()
+                            return
+                        sd_match = re.search(r"(StartDate=)([^&]*)", url)
+                        if sd_match:
+                            target_encoded = quote_plus(target_date_str)
+                            new_url = (
+                                url[: sd_match.start(2)]
+                                + target_encoded
+                                + url[sd_match.end(2) :]
+                            )
+                            logger.debug(
+                                "Rewrote StartDate: %s -> %s",
+                                sd_match.group(2)[:30],
+                                target_encoded[:30],
+                            )
+                            route.continue_(url=new_url)
+                        else:
+                            route.continue_()
+
+                    self._page.route(
+                        "**/GetInventoryCountData*", _rewrite_start_date
+                    )
+
+                    with self._page.expect_response(
+                        lambda r: "GetInventoryCountData" in r.url,
+                        timeout=30000,
+                    ) as rewrite_info:
+                        self._page.select_option(
+                            "#box-widget_InitialProductSelection",
+                            value=initial_value,
+                        )
+
+                    self._page.unroute("**/GetInventoryCountData*")
+                    rewrite_resp = rewrite_info.value
+                    logger.debug(
+                        "Rewrite response: status=%s", rewrite_resp.status
+                    )
+
+                    if rewrite_resp.status == 200:
+                        text = rewrite_resp.text()
+                        data = self._parse_jsonp(text)
+                        if isinstance(data, list):
+                            logger.debug(
+                                "Got %s inventory items for %s/%s",
+                                len(data),
+                                month,
+                                year,
+                            )
+                        return data
+                    else:
+                        try:
+                            body = rewrite_resp.text()[:500]
+                        except Exception:
+                            body = "(could not read)"
+                        logger.warning(
+                            "Rewrite request returned %s (attempt %s/%s)"
+                            "\n  body: %s",
+                            rewrite_resp.status,
+                            attempt,
+                            max_attempts,
+                            body,
+                        )
+                        continue
+                else:
+                    # Passthrough itself failed — likely reCAPTCHA block
                     try:
-                        resp_body = response.text()[:500]
+                        body = passthrough_resp.text()[:500]
                     except Exception:
-                        resp_body = "(could not read body)"
+                        body = "(could not read)"
                     logger.warning(
-                        "API returned %s (attempt %s/%s)\n  body: %s",
-                        response.status,
+                        "Passthrough returned %s (attempt %s/%s)"
+                        "\n  body: %s",
+                        passthrough_resp.status,
                         attempt,
                         max_attempts,
-                        resp_body,
+                        body,
                     )
                     continue
-
-                text = response.text()
-                data = self._parse_jsonp(text)
-                if isinstance(data, list):
-                    logger.debug(
-                        "Got %s inventory items for %s/%s",
-                        len(data),
-                        month,
-                        year,
-                    )
-                return data
 
             except Exception as e:
                 if attempt < max_attempts:
@@ -294,8 +362,10 @@ class YosemiteLodging(BaseProvider):
                 else:
                     raise
             finally:
-                # Always clean up the route handler so it doesn't
-                # stack across retries.
+                try:
+                    self._page.unroute("**/*")
+                except Exception:
+                    pass
                 try:
                     self._page.unroute("**/GetInventoryCountData*")
                 except Exception:
