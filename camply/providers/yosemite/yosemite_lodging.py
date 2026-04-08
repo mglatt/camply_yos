@@ -19,7 +19,7 @@ import re
 from calendar import monthrange
 from datetime import datetime, timedelta
 from typing import List, Optional
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from urllib.parse import quote_plus
 
 from camply.config.api_config import YosemiteConfig
 from camply.containers import AvailableCampsite, CampgroundFacility, RecreationArea
@@ -178,11 +178,12 @@ class YosemiteLodging(BaseProvider):
             f"{YosemiteConfig.YOSEMITE_RECREATION_AREA_ID}:{multiprop_code}"
         )
 
-        # Build target StartDate using the browser's JS engine so the
-        # format (including timezone name) matches exactly what the
-        # AHLS widget would produce.
+        # Build target StartDate using the browser's JS engine.
+        # The AHLS widget sends the short date form produced by
+        # Date.toDateString() — e.g. "Wed Jul 01 2026" — NOT the
+        # full Date.toString() that includes time and timezone.
         target_date_str = self._page.evaluate(
-            f"new Date({year}, {month - 1}, 1).toString()"
+            f"new Date({year}, {month - 1}, 1).toDateString()"
         )
         logger.debug("Target StartDate: %s", target_date_str)
 
@@ -208,18 +209,23 @@ class YosemiteLodging(BaseProvider):
                         route.continue_()
                         return
 
-                    parsed = urlparse(url)
-                    params = parse_qs(parsed.query, keep_blank_values=True)
-
-                    if "StartDate" in params:
-                        original = params["StartDate"][0]
-                        params["StartDate"] = [target_date_str]
-                        new_query = urlencode(params, doseq=True)
-                        new_url = urlunparse(parsed._replace(query=new_query))
+                    # Surgical regex replacement of just the StartDate
+                    # value.  Avoids parse_qs/urlencode round-trip which
+                    # can corrupt the JSONP callback ($) or reCAPTCHA
+                    # token encoding.
+                    match = re.search(r"(StartDate=)([^&]*)", url)
+                    if match:
+                        original_encoded = match.group(2)
+                        target_encoded = quote_plus(target_date_str)
+                        new_url = (
+                            url[: match.start(2)]
+                            + target_encoded
+                            + url[match.end(2) :]
+                        )
                         logger.debug(
                             "Rewrote StartDate: %s -> %s",
-                            original[:30],
-                            target_date_str[:30],
+                            original_encoded[:30],
+                            target_encoded[:30],
                         )
                         route.continue_(url=new_url)
                     else:
