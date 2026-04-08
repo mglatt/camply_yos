@@ -108,11 +108,47 @@ class YosemiteLodging(BaseProvider):
             logger.debug("playwright-stealth applied")
         except ImportError:
             pass
+        # Capture the widget config response during page load — it may
+        # contain room type definitions we need for per-type results.
+        self._widget_config = None
+
+        def _capture_config(response):
+            if "GetWidgetConfigData" in response.url and response.status == 200:
+                try:
+                    text = response.text()
+                    self._widget_config = self._parse_jsonp(text)
+                    logger.debug(
+                        "Captured widget config (%s chars)",
+                        len(text),
+                    )
+                except Exception as exc:
+                    logger.debug("Could not parse widget config: %s", exc)
+
+        self._page.on("response", _capture_config)
         self._page.goto(YosemiteConfig.SEARCH_PAGE_URL, wait_until="networkidle")
         # Wait for the visible search widget to be ready
         self._page.wait_for_selector(
             "#box-widget_InitialProductSelection", timeout=30000
         )
+        if self._widget_config is not None:
+            # Log a summary of what the config contains
+            if isinstance(self._widget_config, dict):
+                logger.debug(
+                    "Widget config top-level keys: %s",
+                    list(self._widget_config.keys()),
+                )
+                # Look for room type / unit type info
+                for key in ["UnitTypes", "RoomTypes", "Units", "Products"]:
+                    if key in self._widget_config:
+                        val = self._widget_config[key]
+                        logger.debug(
+                            "Widget config[%s] (%s items): %s",
+                            key,
+                            len(val) if isinstance(val, list) else "?",
+                            str(val)[:500],
+                        )
+        else:
+            logger.debug("No widget config captured during page load")
         logger.info("Browser ready - search page loaded.")
         self._browser_ready = True
 
@@ -346,6 +382,18 @@ class YosemiteLodging(BaseProvider):
                                 month,
                                 year,
                             )
+                            # Log first item's full structure and a
+                            # few sample AvailableCounts so we can see
+                            # what the API returns beyond DateKey.
+                            if data:
+                                logger.debug(
+                                    "Sample inventory item keys: %s",
+                                    list(data[0].keys()),
+                                )
+                                logger.debug(
+                                    "First 3 items: %s",
+                                    data[:3],
+                                )
                         return data
                     else:
                         try:
@@ -469,6 +517,18 @@ class YosemiteLodging(BaseProvider):
                 f"\t{logging_utils.get_emoji(available_dates)}\t"
                 f"{len(available_dates)} available dates found for {prop_name}."
             )
+
+            # Log AvailableCount for dates in our search window so we
+            # can see if the count represents room types or total rooms.
+            for item in available_dates:
+                d = datetime.strptime(item["DateKey"], "%Y-%m-%d").date()
+                if start_date <= d <= end_date:
+                    logger.debug(
+                        "  %s: AvailableCount=%s  (full item: %s)",
+                        item["DateKey"],
+                        item.get("AvailableCount"),
+                        item,
+                    )
 
             booking_url = self._build_booking_url(prop_code)
             for item in available_dates:
