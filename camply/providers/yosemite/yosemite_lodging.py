@@ -193,7 +193,7 @@ class YosemiteLodging(BaseProvider):
         end_str = self._format_date_for_api(end_date)
 
         result = self._page.evaluate(
-            """async ([multiPropCode, cresPropCode, startDate, endDate, searchPath]) => {
+            """async ([multiPropCode, cresPropCode, startDate, endDate, searchPath, fallbackSiteKey, fallbackAction]) => {
                 // Determine which execute function to use
                 const isEnterprise = (typeof grecaptcha.enterprise !== 'undefined' &&
                     typeof grecaptcha.enterprise.execute === 'function');
@@ -212,10 +212,10 @@ class YosemiteLodging(BaseProvider):
                     const el = document.querySelector('[data-sitekey]');
                     if (el) siteKey = el.getAttribute('data-sitekey');
                 }
-                if (!siteKey) throw new Error('Could not find reCAPTCHA site key on page');
+                if (!siteKey) siteKey = fallbackSiteKey;
 
-                // Use captured action if available, otherwise try common actions
-                const action = window.__capturedRecaptchaAction || 'submit';
+                // Use captured action if available, otherwise use known action
+                const action = window.__capturedRecaptchaAction || fallbackAction;
 
                 // Generate token
                 const token = await execFn(siteKey, {action: action});
@@ -255,6 +255,8 @@ class YosemiteLodging(BaseProvider):
                 start_str,
                 end_str,
                 YosemiteConfig.API_SEARCH_PATH,
+                YosemiteConfig.RECAPTCHA_SITE_KEY,
+                YosemiteConfig.RECAPTCHA_ACTION,
             ],
         )
         return result

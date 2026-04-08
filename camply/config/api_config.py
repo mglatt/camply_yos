@@ -220,7 +220,8 @@ class YosemiteConfig(DataColumns, APIConfig):
     )
 
     CRES_PROP_CODE: str = "000000"
-    RECAPTCHA_SITE_KEY: str = "6LfKL4EfAAAAAQhWM8Rc-UGM02Z1Z0LRgEuqzDS"
+    RECAPTCHA_SITE_KEY: str = "6LfKL4EfAAAAAAQhWM8Rc-UGM02Z1Z0LRgEuqzDS"
+    RECAPTCHA_ACTION: str = "SearchProductAvailability"
 
     YOSEMITE_RECREATION_AREA_ID: int = 2
     YOSEMITE_RECREATION_AREA_NAME: str = "Yosemite"
