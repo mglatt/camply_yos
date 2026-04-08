@@ -371,14 +371,36 @@ class YosemiteLodging(BaseProvider):
         )
         self._page.wait_for_timeout(2000)
 
-        # Fill dates via the native date inputs (type="date", ISO format)
-        self._page.fill("#box-widget_ArrivalDate_nd", checkin_iso)
-        self._page.fill("#box-widget_DepartureDate_nd", checkout_iso)
+        # Fill dates via JavaScript — the native date inputs (_nd) are
+        # hidden behind a custom datepicker UI, so Playwright's fill()
+        # can't interact with them directly.  Set values on both the
+        # hidden native inputs and the visible text inputs, then
+        # dispatch change events to trigger the widget's JS.
+        # Text inputs use M/D/YYYY format; native inputs use YYYY-MM-DD.
+        parts = checkin_iso.split("-")
+        checkin_text = f"{int(parts[1])}/{int(parts[2])}/{parts[0]}"
+        parts = checkout_iso.split("-")
+        checkout_text = f"{int(parts[1])}/{int(parts[2])}/{parts[0]}"
+
+        self._page.evaluate(
+            f"""() => {{
+                // Set native date inputs
+                const arrNd = document.querySelector('#box-widget_ArrivalDate_nd');
+                const depNd = document.querySelector('#box-widget_DepartureDate_nd');
+                if (arrNd) {{ arrNd.value = '{checkin_iso}'; arrNd.dispatchEvent(new Event('change', {{bubbles: true}})); }}
+                if (depNd) {{ depNd.value = '{checkout_iso}'; depNd.dispatchEvent(new Event('change', {{bubbles: true}})); }}
+                // Set visible text inputs
+                const arr = document.querySelector('#box-widget_ArrivalDate');
+                const dep = document.querySelector('#box-widget_DepartureDate');
+                if (arr) {{ arr.value = '{checkin_text}'; arr.dispatchEvent(new Event('change', {{bubbles: true}})); }}
+                if (dep) {{ dep.value = '{checkout_text}'; dep.dispatchEvent(new Event('change', {{bubbles: true}})); }}
+            }}"""
+        )
         logger.debug(
             "Form search: %s checkin=%s checkout=%s",
             multiprop_code,
-            checkin_iso,
-            checkout_iso,
+            checkin_text,
+            checkout_text,
         )
 
         self._page.wait_for_timeout(1000)
