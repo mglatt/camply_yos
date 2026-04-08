@@ -47,6 +47,7 @@ class YosemiteLodging(BaseProvider):
         self._browser_cookies_synced = False
         self._recaptcha_ready = False
         self._use_enterprise = False
+        self._site_key = None
         self.session.headers.update(
             {
                 "Accept": "text/javascript, application/javascript, "
@@ -108,8 +109,29 @@ class YosemiteLodging(BaseProvider):
             "typeof grecaptcha.enterprise !== 'undefined' "
             "&& typeof grecaptcha.enterprise.execute === 'function'"
         )
+        # Extract site key from the page instead of using hardcoded value
+        self._site_key = self._page.evaluate(
+            """() => {
+                // Try the render= parameter in the recaptcha script URL
+                const scripts = document.querySelectorAll('script[src*="recaptcha"]');
+                for (const s of scripts) {
+                    const m = s.src.match(/[?&]render=([^&]+)/);
+                    if (m && m[1] !== 'explicit') return m[1];
+                }
+                // Try data-sitekey attributes
+                const el = document.querySelector('[data-sitekey]');
+                if (el) return el.getAttribute('data-sitekey');
+                return null;
+            }"""
+        )
+        if not self._site_key:
+            # Fall back to config value
+            self._site_key = YosemiteConfig.RECAPTCHA_SITE_KEY
         api_type = "enterprise" if self._use_enterprise else "standard"
-        logger.info(f"Browser ready - reCAPTCHA loaded ({api_type} API).")
+        logger.info(
+            f"Browser ready - reCAPTCHA loaded ({api_type} API, "
+            f"site key: {self._site_key[:8]}...)."
+        )
         self._recaptcha_ready = True
 
     def _get_recaptcha_token(self) -> str:
@@ -118,7 +140,7 @@ class YosemiteLodging(BaseProvider):
         Tokens are single-use and expire in ~2 minutes.
         """
         self._ensure_browser()
-        site_key = YosemiteConfig.RECAPTCHA_SITE_KEY
+        site_key = self._site_key
         if self._use_enterprise:
             token = self._page.evaluate(
                 f"grecaptcha.enterprise.execute('{site_key}', {{action: 'submit'}})"
