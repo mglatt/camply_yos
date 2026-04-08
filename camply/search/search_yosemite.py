@@ -80,7 +80,9 @@ class SearchYosemite(BaseCampingSearch):
         for month in self.search_months:
             if month >= this_month:
                 all_campsites += self.campsite_finder.get_monthly_campsites(
-                    month=month, nights=None if self.nights == 1 else self.nights
+                    month=month,
+                    nights=None if self.nights == 1 else self.nights,
+                    property_codes=searchable_campgrounds,
                 )
         matching_campsites = self._filter_campsites_to_campgrounds(
             campsites=all_campsites, searchable_campgrounds=searchable_campgrounds

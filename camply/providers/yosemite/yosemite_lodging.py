@@ -197,9 +197,10 @@ class YosemiteLodging(BaseProvider):
         self,
         month: datetime,
         nights: Optional[int] = None,
+        property_codes: Optional[set] = None,
     ) -> List[AvailableCampsite]:
         """
-        Return all available campsites for a given month across all properties.
+        Return all available campsites for a given month.
 
         Parameters
         ----------
@@ -207,6 +208,9 @@ class YosemiteLodging(BaseProvider):
             Month to search (day is ignored, uses 1st of month)
         nights: Optional[int]
             Number of consecutive nights (used for booking_nights field)
+        property_codes: Optional[set]
+            If provided, only search these property codes (e.g., {'H', 'D'}).
+            If None, searches all properties.
 
         Returns
         -------
@@ -222,7 +226,14 @@ class YosemiteLodging(BaseProvider):
         booking_nights = nights if nights is not None else 1
         all_campsites = []
 
-        for prop_code, prop_name in YosemiteConfig.YOSEMITE_PROPERTIES.items():
+        # Only search requested properties (or all if none specified)
+        properties = {
+            code: name
+            for code, name in YosemiteConfig.YOSEMITE_PROPERTIES.items()
+            if property_codes is None or code in property_codes
+        }
+
+        for prop_code, prop_name in properties.items():
             logger.info(
                 f"Searching Yosemite Lodging Availability: "
                 f"{prop_name} - {month.strftime('%B, %Y')}"
