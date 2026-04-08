@@ -4,14 +4,17 @@ Yosemite National Park Lodging Provider
 Uses the Aramark/AHLS booking system at reservations.ahlsmsworld.com
 to check availability for Yosemite lodging properties.
 
-Requires Playwright for reCAPTCHA v3 token generation:
+Automates the search page via Playwright — selects properties and months
+in the calendar widget, and intercepts the GetInventoryCountData API
+responses. This lets the page handle reCAPTCHA Enterprise internally.
+
+Requires Playwright:
     pip install playwright && python -m playwright install chromium
 """
 
 import json
 import logging
 import re
-import time
 from calendar import monthrange
 from datetime import datetime, timedelta
 from typing import List, Optional
@@ -31,6 +34,9 @@ class YosemiteLodging(BaseProvider):
     Searches the Aramark/AHLS reservation system for availability
     at Yosemite lodging properties (Curry Village, Housekeeping Camp,
     The Ahwahnee, Tuolumne Meadows Lodge, Yosemite Valley Lodge).
+
+    Uses Playwright to automate the search page UI and intercept
+    API responses, letting the page handle reCAPTCHA Enterprise natively.
     """
 
     recreation_area = RecreationArea(
@@ -44,27 +50,14 @@ class YosemiteLodging(BaseProvider):
         self._playwright = None
         self._browser = None
         self._page = None
-        self._browser_cookies_synced = False
-        self._recaptcha_ready = False
-        self._use_enterprise = False
-        self.session.headers.update(
-            {
-                "Accept": "text/javascript, application/javascript, "
-                "application/ecmascript, application/x-ecmascript, */*; q=0.01",
-                "X-Requested-With": "XMLHttpRequest",
-                "Referer": YosemiteConfig.SEARCH_PAGE_URL,
-                "Host": "reservations.ahlsmsworld.com",
-            }
-        )
+        self._browser_ready = False
 
     def _ensure_browser(self) -> None:
         """
-        Launch headless browser and navigate to the search page
-        so that reCAPTCHA v3 is loaded and ready to generate tokens.
+        Launch headless browser and navigate to the search page.
         """
-        if self._page is not None and self._recaptcha_ready:
+        if self._page is not None and self._browser_ready:
             return
-        # Clean up any broken previous state
         if self._page is not None:
             self._close_browser()
         try:
@@ -75,7 +68,7 @@ class YosemiteLodging(BaseProvider):
                 "Install it with: pip install playwright && "
                 "python -m playwright install chromium"
             )
-        logger.info("Launching headless browser for reCAPTCHA token generation...")
+        logger.info("Launching headless browser for Yosemite search...")
         self._playwright = sync_playwright().start()
         self._browser = self._playwright.chromium.launch(
             headless=True,
@@ -87,64 +80,16 @@ class YosemiteLodging(BaseProvider):
             user_agent=self.session.headers.get("User-Agent", ""),
         )
         self._page = context.new_page()
-        # Hide webdriver flag to avoid headless detection
         self._page.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
         self._page.goto(YosemiteConfig.SEARCH_PAGE_URL, wait_until="networkidle")
-        # Wait for reCAPTCHA — handle both standard and enterprise APIs
-        self._page.wait_for_function(
-            """() => {
-                if (typeof grecaptcha !== 'undefined') {
-                    if (typeof grecaptcha.execute === 'function') return true;
-                    if (grecaptcha.enterprise && typeof grecaptcha.enterprise.execute === 'function') return true;
-                }
-                return false;
-            }""",
-            timeout=60000,
+        # Wait for the visible search widget to be ready
+        self._page.wait_for_selector(
+            "#box-widget_InitialProductSelection", timeout=30000
         )
-        # Detect which API variant is available
-        self._use_enterprise = self._page.evaluate(
-            "typeof grecaptcha.enterprise !== 'undefined' "
-            "&& typeof grecaptcha.enterprise.execute === 'function'"
-        )
-        api_type = "enterprise" if self._use_enterprise else "standard"
-        logger.info(f"Browser ready - reCAPTCHA loaded ({api_type} API).")
-        self._recaptcha_ready = True
-
-    def _get_recaptcha_token(self) -> str:
-        """
-        Generate a fresh reCAPTCHA v3 token using the browser session.
-        Tokens are single-use and expire in ~2 minutes.
-        """
-        self._ensure_browser()
-        site_key = YosemiteConfig.RECAPTCHA_SITE_KEY
-        if self._use_enterprise:
-            token = self._page.evaluate(
-                f"grecaptcha.enterprise.execute('{site_key}', {{action: 'submit'}})"
-            )
-        else:
-            token = self._page.evaluate(
-                f"grecaptcha.execute('{site_key}', {{action: 'submit'}})"
-            )
-        return token
-
-    def _sync_browser_cookies(self) -> None:
-        """
-        Copy cookies from the Playwright browser context to the requests session.
-        """
-        if self._browser_cookies_synced:
-            return
-        self._ensure_browser()
-        cookies = self._page.context.cookies()
-        for cookie in cookies:
-            self.session.cookies.set(
-                cookie["name"],
-                cookie["value"],
-                domain=cookie.get("domain", ""),
-                path=cookie.get("path", "/"),
-            )
-        self._browser_cookies_synced = True
+        logger.info("Browser ready - search page loaded.")
+        self._browser_ready = True
 
     def _close_browser(self) -> None:
         """Clean up browser resources."""
@@ -155,8 +100,7 @@ class YosemiteLodging(BaseProvider):
             self._playwright.stop()
             self._playwright = None
         self._page = None
-        self._browser_cookies_synced = False
-        self._recaptcha_ready = False
+        self._browser_ready = False
 
     def __del__(self):
         self._close_browser()
@@ -165,66 +109,119 @@ class YosemiteLodging(BaseProvider):
     def _parse_jsonp(text: str) -> object:
         """
         Strip JSONP callback wrapper and parse the JSON payload.
-
-        Handles both named callbacks like:
-            callbackName([{...}])
-        and jQuery-style:
-            jQuery123456_789({...})
         """
         match = re.match(r"^[^(\[{]+\((.+)\);?\s*$", text, re.DOTALL)
         if match:
             return json.loads(match.group(1))
         return json.loads(text)
 
-    @staticmethod
-    def _format_date_for_api(dt: datetime) -> str:
-        """
-        Format a date for the GetInventoryCountData API.
-
-        The API expects dates like: 'Fri May 01 2026'
-        (JavaScript Date toString-style format)
-        """
-        return dt.strftime("%a %b %d %Y")
-
     def _get_inventory_count(
         self,
         multiprop_code: str,
-        start_date: datetime,
-        end_date: datetime,
+        month: int,
+        year: int,
     ) -> list:
         """
-        Call the GetInventoryCountData API for a property and date range.
+        Get inventory count by selecting a property in the page's
+        InitialProductSelection dropdown, then intercepting the
+        GetInventoryCountData API response.
+
+        The page handles reCAPTCHA Enterprise internally when the
+        dropdown triggers the calendar widget search.
 
         Parameters
         ----------
         multiprop_code: str
             Property code (e.g., 'H' for Housekeeping Camp)
-        start_date: datetime
-            Start of date range
-        end_date: datetime
-            End of date range
+        month: int
+            Month number (1-12)
+        year: int
+            Year (e.g., 2026)
 
         Returns
         -------
         list
             List of dicts with 'DateKey' and 'AvailableCount'
         """
-        self._sync_browser_cookies()
-        token = self._get_recaptcha_token()
-        params = {
-            "callback": "camply_callback",
-            "CresPropCode": YosemiteConfig.CRES_PROP_CODE,
-            "MultiPropCode": multiprop_code,
-            "UnitTypeCode": "",
-            "StartDate": self._format_date_for_api(start_date),
-            "EndDate": self._format_date_for_api(end_date),
-            "RecaptchaToken": token,
-            "_": str(int(time.time() * 1000)),
-        }
-        url = f"{YosemiteConfig.API_BASE_URL}{YosemiteConfig.API_SEARCH_PATH}"
-        response = self.session.get(url, params=params, timeout=30)
-        response.raise_for_status()
-        return self._parse_jsonp(response.text)
+        self._ensure_browser()
+
+        max_attempts = 3
+        initial_value = (
+            f"{YosemiteConfig.YOSEMITE_RECREATION_AREA_ID}:{multiprop_code}"
+        )
+        target_month_val = str(month - 1)  # Page uses 0-indexed months
+        target_year_val = str(year)
+
+        for attempt in range(1, max_attempts + 1):
+            # Reload the page to reset to the landing state
+            self._page.goto(
+                YosemiteConfig.SEARCH_PAGE_URL, wait_until="networkidle"
+            )
+            self._page.wait_for_selector(
+                "#box-widget_InitialProductSelection", timeout=30000
+            )
+
+            try:
+                # Step 1: Select property — this transitions to the detail
+                # view and triggers an API call for the default month.
+                # We don't need this response, just wait for the page to
+                # transition so the calendar month/year selects appear.
+                self._page.select_option(
+                    "#box-widget_InitialProductSelection",
+                    value=initial_value,
+                )
+                # Wait for the detail view calendar to appear
+                self._page.wait_for_timeout(2000)
+
+                # Step 2: Navigate the calendar to the target month/year
+                # and capture THAT response (which has the right dates).
+                with self._page.expect_response(
+                    lambda r: "GetInventoryCountData" in r.url,
+                    timeout=30000,
+                ) as response_info:
+                    self._page.evaluate(
+                        """([monthVal, yearVal]) => {
+                            const selects = [...document.querySelectorAll('select')];
+                            // Find year select (has year values like 2026, 2027)
+                            for (const sel of selects) {
+                                const vals = [...sel.options].map(o => o.value);
+                                if (vals.includes('2026') && vals.includes('2027')) {
+                                    sel.value = yearVal;
+                                    sel.dispatchEvent(new Event('change', {bubbles: true}));
+                                    break;
+                                }
+                            }
+                            // Find month select (has month abbreviations)
+                            for (const sel of selects) {
+                                const texts = [...sel.options].map(o => o.text);
+                                if (texts.some(t => ['Jun','Jul','Aug','Sep',
+                                                     'Oct','Nov','Dec'].includes(t))) {
+                                    sel.value = monthVal;
+                                    sel.dispatchEvent(new Event('change', {bubbles: true}));
+                                    break;
+                                }
+                            }
+                        }""",
+                        [target_month_val, target_year_val],
+                    )
+
+                response = response_info.value
+                if response.status != 200:
+                    logger.warning(
+                        f"API returned {response.status} on attempt "
+                        f"{attempt}/{max_attempts}"
+                    )
+                    continue
+                text = response.text()
+                return self._parse_jsonp(text)
+
+            except Exception as e:
+                if attempt < max_attempts:
+                    logger.info(
+                        f"Attempt {attempt}/{max_attempts} failed, retrying..."
+                    )
+                else:
+                    raise
 
     def _build_booking_url(self, property_code: str) -> str:
         """Build a browser-loadable booking URL for a property."""
@@ -235,9 +232,10 @@ class YosemiteLodging(BaseProvider):
         self,
         month: datetime,
         nights: Optional[int] = None,
+        property_codes: Optional[set] = None,
     ) -> List[AvailableCampsite]:
         """
-        Return all available campsites for a given month across all properties.
+        Return all available campsites for a given month.
 
         Parameters
         ----------
@@ -245,6 +243,9 @@ class YosemiteLodging(BaseProvider):
             Month to search (day is ignored, uses 1st of month)
         nights: Optional[int]
             Number of consecutive nights (used for booking_nights field)
+        property_codes: Optional[set]
+            If provided, only search these property codes (e.g., {'H', 'D'}).
+            If None, searches all properties.
 
         Returns
         -------
@@ -260,7 +261,14 @@ class YosemiteLodging(BaseProvider):
         booking_nights = nights if nights is not None else 1
         all_campsites = []
 
-        for prop_code, prop_name in YosemiteConfig.YOSEMITE_PROPERTIES.items():
+        # Only search requested properties (or all if none specified)
+        properties = {
+            code: name
+            for code, name in YosemiteConfig.YOSEMITE_PROPERTIES.items()
+            if property_codes is None or code in property_codes
+        }
+
+        for prop_code, prop_name in properties.items():
             logger.info(
                 f"Searching Yosemite Lodging Availability: "
                 f"{prop_name} - {month.strftime('%B, %Y')}"
@@ -268,8 +276,8 @@ class YosemiteLodging(BaseProvider):
             try:
                 inventory = self._get_inventory_count(
                     multiprop_code=prop_code,
-                    start_date=start_date,
-                    end_date=end_date,
+                    month=start_date.month,
+                    year=start_date.year,
                 )
             except Exception as e:
                 logger.warning(
@@ -292,6 +300,9 @@ class YosemiteLodging(BaseProvider):
             for item in available_dates:
                 date_str = item["DateKey"]
                 booking_date = datetime.strptime(date_str, "%Y-%m-%d")
+                # Skip dates outside our actual range
+                if booking_date.date() < start_date or booking_date.date() > end_date:
+                    continue
                 booking_end = booking_date + timedelta(days=booking_nights)
                 campsite = AvailableCampsite(
                     campsite_id=f"{prop_code}_{date_str}",
