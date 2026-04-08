@@ -465,27 +465,27 @@ class YosemiteLodging(BaseProvider):
     def _search_room_types(
         self,
         multiprop_code: str,
-        checkin: str,
-        checkout: str,
+        checkin_iso: str,
+        checkout_iso: str,
     ) -> list:
         """
         Perform a full search via form submission to get room-type-level
-        results.  This fills in the search form (property, dates) and
-        clicks CHECK AVAILABILITY, then parses the results page.
+        results.  Fills the search form and clicks CHECK AVAILABILITY,
+        then captures the resulting network responses and page content.
 
         Parameters
         ----------
         multiprop_code: str
             Property code (e.g., 'D' for Curry Village)
-        checkin: str
-            Check-in date as 'M/D/YYYY' (e.g., '7/6/2026')
-        checkout: str
-            Check-out date as 'M/D/YYYY' (e.g., '7/7/2026')
+        checkin_iso: str
+            Check-in date in ISO format (e.g., '2026-07-06')
+        checkout_iso: str
+            Check-out date in ISO format (e.g., '2026-07-07')
 
         Returns
         -------
         list
-            List of dicts with room type info (name, available, etc.)
+            List of dicts with room type info
         """
         self._ensure_browser()
 
@@ -501,113 +501,80 @@ class YosemiteLodging(BaseProvider):
             "#box-widget_InitialProductSelection", timeout=30000
         )
 
-        # Select property
+        # Select property — this reveals the date form
         self._page.select_option(
             "#box-widget_InitialProductSelection",
             value=initial_value,
         )
+        self._page.wait_for_timeout(2000)
+
+        # Fill dates via the native date inputs (type="date", ISO format)
+        # These are the actual form fields the widget uses.
+        self._page.fill("#box-widget_ArrivalDate_nd", checkin_iso)
+        self._page.fill("#box-widget_DepartureDate_nd", checkout_iso)
+        logger.debug(
+            "Filled dates: checkin=%s checkout=%s",
+            checkin_iso,
+            checkout_iso,
+        )
+
+        # Wait a moment for the form to validate dates
         self._page.wait_for_timeout(1000)
 
-        # Fill in dates — find the date input fields
-        checkin_input = self._page.query_selector(
-            "#widget_DateCheckIn, input[name='CheckIn'], "
-            "input[name='checkin'], input[name='StartDate']"
-        )
-        checkout_input = self._page.query_selector(
-            "#widget_DateCheckOut, input[name='CheckOut'], "
-            "input[name='checkout'], input[name='EndDate']"
-        )
-
-        # Log what date fields we found
-        all_inputs = self._page.query_selector_all("input")
-        logger.debug(
-            "All input fields on page: %s",
-            [
-                {
-                    "id": inp.get_attribute("id") or "",
-                    "name": inp.get_attribute("name") or "",
-                    "type": inp.get_attribute("type") or "",
-                    "value": inp.get_attribute("value") or "",
-                }
-                for inp in all_inputs
-            ],
-        )
-
-        if checkin_input:
-            logger.debug(
-                "Found checkin input: id=%s name=%s",
-                checkin_input.get_attribute("id"),
-                checkin_input.get_attribute("name"),
-            )
-            checkin_input.fill(checkin)
-        else:
-            logger.warning("Could not find check-in date input")
-
-        if checkout_input:
-            logger.debug(
-                "Found checkout input: id=%s name=%s",
-                checkout_input.get_attribute("id"),
-                checkout_input.get_attribute("name"),
-            )
-            checkout_input.fill(checkout)
-        else:
-            logger.warning("Could not find check-out date input")
-
-        # Find and click the CHECK AVAILABILITY button
+        # Click the non-disabled CHECK AVAILABILITY submit button.
+        # There are two on the page — the first is disabled (initial
+        # form), the second is the real one (after property selection).
         button = self._page.query_selector(
-            "button:has-text('Check Availability'), "
-            "input[type='submit'][value*='Availability'], "
-            "a:has-text('Check Availability'), "
-            ".btn-search, #btnSearch"
+            "input[type='submit'][value='Check Availability']:not([disabled])"
         )
-        all_buttons = self._page.query_selector_all("button, input[type='submit']")
-        logger.debug(
-            "All buttons on page: %s",
-            [
-                {
-                    "tag": btn.evaluate("e => e.tagName"),
-                    "id": btn.get_attribute("id") or "",
-                    "text": btn.inner_text()[:50] if btn.evaluate("e => e.tagName") == "BUTTON" else btn.get_attribute("value") or "",
-                    "class": btn.get_attribute("class") or "",
-                }
-                for btn in all_buttons
-            ],
-        )
-
         if not button:
-            logger.warning("Could not find CHECK AVAILABILITY button")
-            return []
+            logger.warning(
+                "No enabled CHECK AVAILABILITY button found — "
+                "trying force-click on any submit"
+            )
+            button = self._page.query_selector(
+                "input[type='submit'][value='Check Availability']"
+            )
+            if button:
+                button.click(force=True)
+            else:
+                logger.warning("No CHECK AVAILABILITY button found at all")
+                return []
+        else:
+            logger.debug("Found enabled CHECK AVAILABILITY button")
 
         # Capture all network responses during the search
         captured_responses = []
 
         def _capture_search_responses(response):
             url = response.url
-            # Log any search-related API calls
             if any(
                 kw in url
                 for kw in [
                     "Search", "Availability", "Result",
                     "UnitType", "Room", "Inventory",
+                    "Accommodation",
                 ]
             ):
                 try:
-                    body = response.text()[:2000]
+                    body = response.text()[:3000]
                 except Exception:
                     body = "(could not read)"
-                captured_responses.append(
-                    {"url": url[:200], "status": response.status}
-                )
+                captured_responses.append({
+                    "url": url[:300],
+                    "status": response.status,
+                    "body_preview": body[:1500],
+                })
                 logger.debug(
-                    "Search response: %s status=%s\n  body: %s",
-                    url[:200],
+                    "Search response: status=%s url=%s\n  body: %s",
                     response.status,
-                    body[:1000],
+                    url[:300],
+                    body[:1500],
                 )
 
         self._page.on("response", _capture_search_responses)
 
-        logger.debug("Clicking CHECK AVAILABILITY button...")
+        logger.debug("Clicking CHECK AVAILABILITY...")
         button.click()
 
         # Wait for navigation or network activity
@@ -620,14 +587,15 @@ class YosemiteLodging(BaseProvider):
 
         logger.debug(
             "After search: URL=%s, captured %s responses",
-            self._page.url[:200],
+            self._page.url[:300],
             len(captured_responses),
         )
 
-        # Parse the results page — look for room type elements
-        # The website shows room type cards with names and prices
-        result_text = self._page.inner_text("body")[:3000]
-        logger.debug("Results page text (first 3000 chars):\n%s", result_text)
+        # Log the resulting page text to see room type cards
+        result_text = self._page.inner_text("body")[:5000]
+        logger.debug(
+            "Results page text (first 5000 chars):\n%s", result_text
+        )
 
         return captured_responses
 
@@ -709,22 +677,18 @@ class YosemiteLodging(BaseProvider):
             for item in available_dates:
                 d = datetime.strptime(item["DateKey"], "%Y-%m-%d").date()
                 if start_date <= d <= end_date:
-                    checkin_str = f"{d.month}/{d.day}/{d.year}"
                     checkout_d = d + timedelta(days=booking_nights)
-                    checkout_str = (
-                        f"{checkout_d.month}/{checkout_d.day}/{checkout_d.year}"
-                    )
                     logger.info(
                         "DIAGNOSTIC: Attempting form search for "
                         "%s %s -> %s",
                         prop_name,
-                        checkin_str,
-                        checkout_str,
+                        d.isoformat(),
+                        checkout_d.isoformat(),
                     )
                     self._search_room_types(
                         multiprop_code=prop_code,
-                        checkin=checkin_str,
-                        checkout=checkout_str,
+                        checkin_iso=d.isoformat(),
+                        checkout_iso=checkout_d.isoformat(),
                     )
                     break  # Only do one diagnostic search
 
