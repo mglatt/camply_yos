@@ -28,6 +28,7 @@ from .usedirect.variations import (
     VirginiaStateParks,
 )
 from .xanterra.yellowstone_lodging import Yellowstone
+from .yosemite.yosemite_lodging import YosemiteLodging
 
 ProviderType = Union[
     GoingToCamp,
@@ -37,6 +38,7 @@ ProviderType = Union[
     RecreationDotGovTicket,
     RecreationDotGovTimedEntry,
     Yellowstone,
+    YosemiteLodging,
     ReserveCalifornia,
     NorthernTerritory,
     FloridaStateParks,
@@ -61,6 +63,7 @@ __all__ = [
     "RecreationDotGovTicket",
     "RecreationDotGovTimedEntry",
     "Yellowstone",
+    "YosemiteLodging",
     "ReserveCalifornia",
     "NorthernTerritory",
     "FloridaStateParks",
