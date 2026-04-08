@@ -131,39 +131,7 @@ class YosemiteLodging(BaseProvider):
             "#box-widget_InitialProductSelection", timeout=30000
         )
         if self._widget_config is not None:
-            # Log a summary of what the config contains
-            if isinstance(self._widget_config, dict):
-                logger.debug(
-                    "Widget config top-level keys: %s",
-                    list(self._widget_config.keys()),
-                )
-                # Dig into Accommodation to find room type codes
-                # per property (MultipropConfigurationSettingsList).
-                accom = self._widget_config.get("Accommodation", [])
-                if isinstance(accom, list) and accom:
-                    mplist = accom[0].get(
-                        "MultipropConfigurationSettingsList", []
-                    )
-                    logger.debug(
-                        "Accommodation has %s multiprop entries", len(mplist)
-                    )
-                    for mp in mplist:
-                        mp_code = mp.get("MultipropCode", "?")
-                        mp_name = mp.get("MultipropName", "?")
-                        # Log key fields for each property
-                        mp_keys = list(mp.keys())
-                        logger.debug(
-                            "  MultipropCode=%s  Name=%s  keys=%s",
-                            mp_code,
-                            mp_name,
-                            mp_keys,
-                        )
-                        # If this is Curry Village (D), dump more detail
-                        if mp_code == "D":
-                            logger.debug(
-                                "  Full Curry Village entry: %s",
-                                json.dumps(mp, indent=2, default=str)[:3000],
-                            )
+            logger.debug("Widget config captured successfully")
         else:
             logger.debug("No widget config captured during page load")
         logger.info("Browser ready - search page loaded.")
@@ -203,12 +171,10 @@ class YosemiteLodging(BaseProvider):
         Get inventory count by selecting a property from the dropdown
         and intercepting the GetInventoryCountData API response.
 
-        The AHLS widget does NOT expose month/year <select> elements.
-        Instead, the target month is controlled via the ``StartDate``
-        query parameter in the API URL.  We use Playwright route
-        interception to rewrite that parameter before the request
-        leaves the browser, so the page's own reCAPTCHA Enterprise
-        token stays valid while we get data for the month we want.
+        Uses Playwright route interception to rewrite the StartDate and
+        EndDate query parameters before the request leaves the browser,
+        so the page's own reCAPTCHA Enterprise token stays valid while
+        we get data for the month we want.
 
         Parameters
         ----------
@@ -226,7 +192,7 @@ class YosemiteLodging(BaseProvider):
         """
         self._ensure_browser()
 
-        max_attempts = 3
+        max_attempts = 4
         initial_value = (
             f"{YosemiteConfig.YOSEMITE_RECREATION_AREA_ID}:{multiprop_code}"
         )
@@ -234,12 +200,9 @@ class YosemiteLodging(BaseProvider):
         # Build target StartDate and EndDate using the browser's JS
         # engine.  The AHLS widget uses Date.toDateString() format
         # (e.g. "Wed Jul 01 2026") and sends a 3-month window.
-        # Both must be rewritten or the server rejects the range.
         target_start_str = self._page.evaluate(
             f"new Date({year}, {month - 1}, 1).toDateString()"
         )
-        # EndDate = last day of the month 2 months after StartDate
-        # (mirroring the widget's 3-month window: Mar 1 → May 31).
         end_month = month + 2
         end_year = year
         if end_month > 12:
@@ -254,7 +217,7 @@ class YosemiteLodging(BaseProvider):
         )
 
         for attempt in range(1, max_attempts + 1):
-            # Reload the page to reset to the landing state
+            # Reload the page to get a fresh reCAPTCHA token
             self._page.goto(
                 YosemiteConfig.SEARCH_PAGE_URL, wait_until="networkidle"
             )
@@ -263,182 +226,73 @@ class YosemiteLodging(BaseProvider):
             )
 
             try:
-                # ----------------------------------------------------------
-                # Phase A: Passthrough — let the original request go
-                # unmodified so we can confirm the API works at all and
-                # capture the full original URL for comparison.
-                # ----------------------------------------------------------
-                captured_url = {}
-
-                def _log_passthrough(route):
+                # Intercept the outgoing API request and rewrite dates
+                def _rewrite_dates(route):
                     url = route.request.url
-                    if "GetInventoryCountData" in url:
-                        captured_url["original"] = url
-                        logger.debug("Passthrough request URL:\n  %s", url)
-                    route.continue_()
+                    if "GetInventoryCountData" not in url:
+                        route.continue_()
+                        return
+                    new_url = url
+                    # Rewrite StartDate
+                    sd_match = re.search(
+                        r"(StartDate=)([^&]*)", new_url
+                    )
+                    if sd_match:
+                        enc_start = quote_plus(target_start_str)
+                        new_url = (
+                            new_url[: sd_match.start(2)]
+                            + enc_start
+                            + new_url[sd_match.end(2) :]
+                        )
+                    # Rewrite EndDate
+                    ed_match = re.search(
+                        r"(EndDate=)([^&]*)", new_url
+                    )
+                    if ed_match:
+                        enc_end = quote_plus(target_end_str)
+                        new_url = (
+                            new_url[: ed_match.start(2)]
+                            + enc_end
+                            + new_url[ed_match.end(2) :]
+                        )
+                    logger.debug(
+                        "Rewriting dates: StartDate=%s, EndDate=%s",
+                        quote_plus(target_start_str)[:25],
+                        quote_plus(target_end_str)[:25],
+                    )
+                    route.continue_(url=new_url)
 
-                self._page.route("**/*", _log_passthrough)
+                self._page.route("**/*", _rewrite_dates)
 
                 with self._page.expect_response(
                     lambda r: "GetInventoryCountData" in r.url,
                     timeout=30000,
-                ) as passthrough_info:
+                ) as resp_info:
                     self._page.select_option(
                         "#box-widget_InitialProductSelection",
                         value=initial_value,
                     )
 
                 self._page.unroute("**/*")
-                passthrough_resp = passthrough_info.value
+                resp = resp_info.value
 
-                logger.debug(
-                    "Passthrough response: status=%s",
-                    passthrough_resp.status,
-                )
-
-                if passthrough_resp.status == 200:
-                    # The unmodified request succeeded.  Parse the
-                    # original StartDate so we can see what month the
-                    # widget defaulted to.
-                    orig_match = re.search(
-                        r"StartDate=([^&]*)",
-                        captured_url.get("original", ""),
-                    )
-                    orig_date = orig_match.group(1) if orig_match else "?"
-                    logger.info(
-                        "Passthrough OK (default StartDate=%s)", orig_date
-                    )
-
-                    # Check if we even need to rewrite — does the
-                    # default month already match our target?
-                    passthrough_text = passthrough_resp.text()
-                    passthrough_data = self._parse_jsonp(passthrough_text)
-                    if isinstance(passthrough_data, list) and passthrough_data:
-                        first_key = passthrough_data[0].get("DateKey", "")
-                        # DateKey is "YYYY-MM-DD"; check month/year
-                        if first_key.startswith(f"{year}-{month:02d}"):
-                            logger.debug(
-                                "Passthrough data already matches "
-                                "target month — using it directly"
-                            )
-                            return passthrough_data
-
-                    # -------------------------------------------------------
-                    # Phase B: Rewrite — now that we know the API works,
-                    # reload and intercept with our target StartDate.
-                    # -------------------------------------------------------
-                    self._page.goto(
-                        YosemiteConfig.SEARCH_PAGE_URL,
-                        wait_until="networkidle",
-                    )
-                    self._page.wait_for_selector(
-                        "#box-widget_InitialProductSelection", timeout=30000
-                    )
-
-                    def _rewrite_dates(route):
-                        url = route.request.url
-                        if "GetInventoryCountData" not in url:
-                            route.continue_()
-                            return
-                        new_url = url
-                        # Rewrite StartDate
-                        sd_match = re.search(
-                            r"(StartDate=)([^&]*)", new_url
-                        )
-                        if sd_match:
-                            enc_start = quote_plus(target_start_str)
-                            new_url = (
-                                new_url[: sd_match.start(2)]
-                                + enc_start
-                                + new_url[sd_match.end(2) :]
-                            )
-                        # Rewrite EndDate
-                        ed_match = re.search(
-                            r"(EndDate=)([^&]*)", new_url
-                        )
-                        if ed_match:
-                            enc_end = quote_plus(target_end_str)
-                            new_url = (
-                                new_url[: ed_match.start(2)]
-                                + enc_end
-                                + new_url[ed_match.end(2) :]
-                            )
+                if resp.status == 200:
+                    text = resp.text()
+                    data = self._parse_jsonp(text)
+                    if isinstance(data, list):
                         logger.debug(
-                            "Rewrote dates: StartDate=%s, EndDate=%s",
-                            quote_plus(target_start_str)[:25],
-                            quote_plus(target_end_str)[:25],
+                            "Got %s inventory items for %s/%s",
+                            len(data),
+                            month,
+                            year,
                         )
-                        route.continue_(url=new_url)
-
-                    self._page.route(
-                        "**/GetInventoryCountData*", _rewrite_dates
-                    )
-
-                    with self._page.expect_response(
-                        lambda r: "GetInventoryCountData" in r.url,
-                        timeout=30000,
-                    ) as rewrite_info:
-                        self._page.select_option(
-                            "#box-widget_InitialProductSelection",
-                            value=initial_value,
-                        )
-
-                    self._page.unroute("**/GetInventoryCountData*")
-                    rewrite_resp = rewrite_info.value
-                    logger.debug(
-                        "Rewrite response: status=%s", rewrite_resp.status
-                    )
-
-                    if rewrite_resp.status == 200:
-                        text = rewrite_resp.text()
-                        data = self._parse_jsonp(text)
-                        if isinstance(data, list):
-                            logger.debug(
-                                "Got %s inventory items for %s/%s",
-                                len(data),
-                                month,
-                                year,
-                            )
-                            # Log first item's full structure and a
-                            # few sample AvailableCounts so we can see
-                            # what the API returns beyond DateKey.
-                            if data:
-                                logger.debug(
-                                    "Sample inventory item keys: %s",
-                                    list(data[0].keys()),
-                                )
-                                logger.debug(
-                                    "First 3 items: %s",
-                                    data[:3],
-                                )
-                        return data
-                    else:
-                        try:
-                            body = rewrite_resp.text()[:500]
-                        except Exception:
-                            body = "(could not read)"
-                        logger.warning(
-                            "Rewrite request returned %s (attempt %s/%s)"
-                            "\n  body: %s",
-                            rewrite_resp.status,
-                            attempt,
-                            max_attempts,
-                            body,
-                        )
-                        continue
+                    return data
                 else:
-                    # Passthrough itself failed — likely reCAPTCHA block
-                    try:
-                        body = passthrough_resp.text()[:500]
-                    except Exception:
-                        body = "(could not read)"
                     logger.warning(
-                        "Passthrough returned %s (attempt %s/%s)"
-                        "\n  body: %s",
-                        passthrough_resp.status,
+                        "API returned %s (attempt %s/%s)",
+                        resp.status,
                         attempt,
                         max_attempts,
-                        body,
                     )
                     continue
 
@@ -451,16 +305,21 @@ class YosemiteLodging(BaseProvider):
                         e,
                     )
                 else:
-                    raise
+                    logger.warning(
+                        "All %s attempts failed for %s/%s: %s",
+                        max_attempts,
+                        month,
+                        year,
+                        e,
+                    )
             finally:
                 try:
                     self._page.unroute("**/*")
                 except Exception:
                     pass
-                try:
-                    self._page.unroute("**/GetInventoryCountData*")
-                except Exception:
-                    pass
+
+        # All attempts exhausted
+        return []
 
     def _search_room_types(
         self,
@@ -671,26 +530,6 @@ class YosemiteLodging(BaseProvider):
                 f"\t{logging_utils.get_emoji(available_dates)}\t"
                 f"{len(available_dates)} available dates found for {prop_name}."
             )
-
-            # DIAGNOSTIC: Try a full form search to discover room types
-            # for the first available date in the search window.
-            for item in available_dates:
-                d = datetime.strptime(item["DateKey"], "%Y-%m-%d").date()
-                if start_date <= d <= end_date:
-                    checkout_d = d + timedelta(days=booking_nights)
-                    logger.info(
-                        "DIAGNOSTIC: Attempting form search for "
-                        "%s %s -> %s",
-                        prop_name,
-                        d.isoformat(),
-                        checkout_d.isoformat(),
-                    )
-                    self._search_room_types(
-                        multiprop_code=prop_code,
-                        checkin_iso=d.isoformat(),
-                        checkout_iso=checkout_d.isoformat(),
-                    )
-                    break  # Only do one diagnostic search
 
             booking_url = self._build_booking_url(prop_code)
             for item in available_dates:
