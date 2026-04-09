@@ -178,6 +178,39 @@ class YosemiteLodging(BaseProvider):
             return json.loads(match.group(1))
         return json.loads(text)
 
+    def _needs_date_rewrite(self, month: int, year: int) -> bool:
+        """
+        Check whether the target month falls outside the widget's natural
+        3-month window.  The widget defaults to a window starting from
+        the current calendar month, so searches within ~3 months of today
+        don't need date rewriting.
+        """
+        now = datetime.now()
+        natural_end_month = now.month + 2
+        natural_end_year = now.year
+        if natural_end_month > 12:
+            natural_end_month -= 12
+            natural_end_year += 1
+        return (year, month) > (natural_end_year, natural_end_month)
+
+    def _select_property(self, initial_value: str) -> None:
+        """
+        Select a property from the dropdown, resetting first if
+        the same value is already selected (to ensure a change event).
+        """
+        current = self._page.evaluate(
+            "document.querySelector('#box-widget_InitialProductSelection').value"
+        )
+        if current == initial_value:
+            # Reset to first option to guarantee a change event fires
+            self._page.select_option(
+                "#box-widget_InitialProductSelection", index=0
+            )
+            self._page.wait_for_timeout(500)
+        self._page.select_option(
+            "#box-widget_InitialProductSelection", value=initial_value
+        )
+
     def _get_inventory_count(
         self,
         multiprop_code: str,
@@ -188,109 +221,119 @@ class YosemiteLodging(BaseProvider):
         Get inventory count by selecting a property from the dropdown
         and intercepting the GetInventoryCountData API response.
 
-        Uses Playwright route interception to rewrite the StartDate and
-        EndDate query parameters before the request leaves the browser,
-        so the page's own reCAPTCHA Enterprise token stays valid while
-        we get data for the month we want.
-
-        Parameters
-        ----------
-        multiprop_code: str
-            Property code (e.g., 'H' for Housekeeping Camp)
-        month: int
-            Month number (1-12)
-        year: int
-            Year (e.g., 2026)
-
-        Returns
-        -------
-        list
-            List of dicts with 'DateKey' and 'AvailableCount'
+        Strategy for reliability:
+        1. First attempt uses the existing page (no reload) — avoids
+           burning an extra reCAPTCHA token.
+        2. If the target month is within the widget's natural 3-month
+           window, skip date rewriting entirely (passthrough mode).
+           This keeps the request identical to what a real user would
+           generate, maximising reCAPTCHA acceptance.
+        3. Only rewrite dates when the target month is outside the
+           natural window.
+        4. On failure, reload with exponential backoff so reCAPTCHA
+           Enterprise can reset its risk score.
         """
         self._ensure_browser()
 
-        max_attempts = 4
+        max_attempts = 5
         initial_value = (
             f"{YosemiteConfig.YOSEMITE_RECREATION_AREA_ID}:{multiprop_code}"
         )
+        need_rewrite = self._needs_date_rewrite(month, year)
 
-        # Build target StartDate and EndDate using the browser's JS
-        # engine.  The AHLS widget uses Date.toDateString() format
-        # (e.g. "Wed Jul 01 2026") and sends a 3-month window.
-        target_start_str = self._page.evaluate(
-            f"new Date({year}, {month - 1}, 1).toDateString()"
-        )
-        end_month = month + 2
-        end_year = year
-        if end_month > 12:
-            end_month -= 12
-            end_year += 1
-        _, end_last_day = monthrange(end_year, end_month)
-        target_end_str = self._page.evaluate(
-            f"new Date({end_year}, {end_month - 1}, {end_last_day}).toDateString()"
-        )
-        logger.debug(
-            "Target date range: %s -> %s", target_start_str, target_end_str
-        )
+        # Build rewrite targets only when needed
+        target_start_str = None
+        target_end_str = None
+        if need_rewrite:
+            target_start_str = self._page.evaluate(
+                f"new Date({year}, {month - 1}, 1).toDateString()"
+            )
+            end_month = month + 2
+            end_year = year
+            if end_month > 12:
+                end_month -= 12
+                end_year += 1
+            _, end_last_day = monthrange(end_year, end_month)
+            target_end_str = self._page.evaluate(
+                f"new Date({end_year}, {end_month - 1}, {end_last_day}).toDateString()"
+            )
+            logger.debug(
+                "Date rewrite: %s -> %s (target outside natural window)",
+                target_start_str,
+                target_end_str,
+            )
+        else:
+            logger.debug(
+                "Passthrough mode for %s/%s (within natural window)",
+                month,
+                year,
+            )
 
         for attempt in range(1, max_attempts + 1):
-            # Reload the page to get a fresh reCAPTCHA token
-            self._page.goto(
-                YosemiteConfig.SEARCH_PAGE_URL, wait_until="networkidle"
-            )
-            self._page.wait_for_selector(
-                "#box-widget_InitialProductSelection", timeout=30000
-            )
+            # First attempt: reuse existing page (no reload).
+            # Retries: reload with exponential backoff for a fresh
+            # reCAPTCHA token.
+            if attempt > 1:
+                backoff = 3 * (2 ** (attempt - 2))  # 3, 6, 12, 24s
+                logger.debug(
+                    "Waiting %ds before retry (attempt %d/%d)...",
+                    backoff,
+                    attempt,
+                    max_attempts,
+                )
+                time.sleep(backoff)
+                self._page.goto(
+                    YosemiteConfig.SEARCH_PAGE_URL,
+                    wait_until="networkidle",
+                )
+                self._page.wait_for_selector(
+                    "#box-widget_InitialProductSelection", timeout=30000
+                )
+                # Extra wait for reCAPTCHA Enterprise to initialise
+                self._page.wait_for_timeout(2000)
 
             try:
-                # Intercept the outgoing API request and rewrite dates
-                def _rewrite_dates(route):
-                    url = route.request.url
-                    if "GetInventoryCountData" not in url:
-                        route.continue_()
-                        return
-                    new_url = url
-                    # Rewrite StartDate
-                    sd_match = re.search(
-                        r"(StartDate=)([^&]*)", new_url
-                    )
-                    if sd_match:
-                        enc_start = quote_plus(target_start_str)
-                        new_url = (
-                            new_url[: sd_match.start(2)]
-                            + enc_start
-                            + new_url[sd_match.end(2) :]
+                if need_rewrite:
+                    def _rewrite_dates(route):
+                        url = route.request.url
+                        if "GetInventoryCountData" not in url:
+                            route.continue_()
+                            return
+                        new_url = url
+                        sd_match = re.search(
+                            r"(StartDate=)([^&]*)", new_url
                         )
-                    # Rewrite EndDate
-                    ed_match = re.search(
-                        r"(EndDate=)([^&]*)", new_url
-                    )
-                    if ed_match:
-                        enc_end = quote_plus(target_end_str)
-                        new_url = (
-                            new_url[: ed_match.start(2)]
-                            + enc_end
-                            + new_url[ed_match.end(2) :]
+                        if sd_match:
+                            enc_start = quote_plus(target_start_str)
+                            new_url = (
+                                new_url[: sd_match.start(2)]
+                                + enc_start
+                                + new_url[sd_match.end(2) :]
+                            )
+                        ed_match = re.search(
+                            r"(EndDate=)([^&]*)", new_url
                         )
-                    logger.debug(
-                        "Rewriting dates: StartDate=%s, EndDate=%s",
-                        quote_plus(target_start_str)[:25],
-                        quote_plus(target_end_str)[:25],
-                    )
-                    route.continue_(url=new_url)
+                        if ed_match:
+                            enc_end = quote_plus(target_end_str)
+                            new_url = (
+                                new_url[: ed_match.start(2)]
+                                + enc_end
+                                + new_url[ed_match.end(2) :]
+                            )
+                        logger.debug("Rewriting dates in request")
+                        route.continue_(url=new_url)
 
-                self._page.route("**/*", _rewrite_dates)
+                    self._page.route("**/*", _rewrite_dates)
 
                 with self._page.expect_response(
                     lambda r: "GetInventoryCountData" in r.url,
                     timeout=30000,
                 ) as resp_info:
-                    self._page.select_option(
-                        "#box-widget_InitialProductSelection",
-                        value=initial_value,
-                    )
+                    self._select_property(initial_value)
 
-                self._page.unroute("**/*")
+                if need_rewrite:
+                    self._page.unroute("**/*")
+
                 resp = resp_info.value
 
                 if resp.status == 200:
@@ -298,35 +341,40 @@ class YosemiteLodging(BaseProvider):
                     data = self._parse_jsonp(text)
                     if isinstance(data, list):
                         logger.debug(
-                            "Got %s inventory items for %s/%s",
+                            "Got %d inventory items for %d/%d",
                             len(data),
                             month,
                             year,
                         )
                     return data
                 else:
+                    # Log response body for diagnostics
+                    body_preview = ""
+                    try:
+                        body_preview = resp.text()[:200]
+                    except Exception:
+                        pass
                     logger.warning(
-                        "API returned %s (attempt %s/%s)",
+                        "API returned %d (attempt %d/%d)%s",
                         resp.status,
                         attempt,
                         max_attempts,
+                        f": {body_preview}" if body_preview else "",
                     )
-                    # Delay before retry to avoid reCAPTCHA rate-limiting
-                    time.sleep(2)
-                    continue
 
             except Exception as e:
                 if attempt < max_attempts:
                     logger.info(
-                        "Attempt %s/%s failed (%s), retrying...",
+                        "Attempt %d/%d failed (%s), retrying...",
                         attempt,
                         max_attempts,
                         e,
                     )
                 else:
                     logger.warning(
-                        "All %s attempts failed for %s/%s: %s",
+                        "All %d attempts failed for %s %d/%d: %s",
                         max_attempts,
+                        multiprop_code,
                         month,
                         year,
                         e,
