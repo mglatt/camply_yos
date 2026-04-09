@@ -178,38 +178,97 @@ class YosemiteLodging(BaseProvider):
             return json.loads(match.group(1))
         return json.loads(text)
 
-    def _needs_date_rewrite(self, month: int, year: int) -> bool:
+    def _ensure_dropdown_visible(self) -> None:
         """
-        Check whether the target month falls outside the widget's natural
-        3-month window.  The widget defaults to a window starting from
-        the current calendar month, so searches within ~3 months of today
-        don't need date rewriting.
+        Ensure the property dropdown is visible, reloading the page
+        if a previous selection hid it.
         """
-        now = datetime.now()
-        natural_end_month = now.month + 2
-        natural_end_year = now.year
-        if natural_end_month > 12:
-            natural_end_month -= 12
-            natural_end_year += 1
-        return (year, month) > (natural_end_year, natural_end_month)
-
-    def _select_property(self, initial_value: str) -> None:
-        """
-        Select a property from the dropdown, resetting first if
-        the same value is already selected (to ensure a change event).
-        """
-        current = self._page.evaluate(
-            "document.querySelector('#box-widget_InitialProductSelection').value"
+        dropdown = self._page.query_selector(
+            "#box-widget_InitialProductSelection"
         )
-        if current == initial_value:
-            # Reset to first option to guarantee a change event fires
-            self._page.select_option(
-                "#box-widget_InitialProductSelection", index=0
+        if dropdown is None or not dropdown.is_visible():
+            logger.debug(
+                "Dropdown hidden (previous selection), reloading"
             )
-            self._page.wait_for_timeout(500)
-        self._page.select_option(
-            "#box-widget_InitialProductSelection", value=initial_value
-        )
+            self._page.goto(
+                YosemiteConfig.SEARCH_PAGE_URL,
+                wait_until="networkidle",
+            )
+            self._page.wait_for_selector(
+                "#box-widget_InitialProductSelection", timeout=30000
+            )
+            self._page.wait_for_timeout(2000)
+
+    def _fetch_once(self, initial_value: str, rewrite_dates_fn=None) -> tuple:
+        """
+        Single attempt: select property, capture API response.
+
+        Returns (data_list, resp_status).  data_list is the parsed
+        inventory list on success, or None on failure.
+        """
+        try:
+            if rewrite_dates_fn:
+                self._page.route("**/*", rewrite_dates_fn)
+
+            with self._page.expect_response(
+                lambda r: "GetInventoryCountData" in r.url,
+                timeout=30000,
+            ) as resp_info:
+                self._page.select_option(
+                    "#box-widget_InitialProductSelection",
+                    value=initial_value,
+                )
+
+            if rewrite_dates_fn:
+                self._page.unroute("**/*")
+
+            resp = resp_info.value
+            if resp.status == 200:
+                data = self._parse_jsonp(resp.text())
+                return (data if isinstance(data, list) else [], resp.status)
+            else:
+                body = ""
+                try:
+                    body = resp.text()[:200]
+                except Exception:
+                    pass
+                return (None, resp.status)
+        except Exception as e:
+            logger.debug("Fetch failed: %s", e)
+            return (None, 0)
+        finally:
+            try:
+                self._page.unroute("**/*")
+            except Exception:
+                pass
+
+    def _make_rewrite_fn(self, target_start_str: str, target_end_str: str):
+        """Build a Playwright route handler that rewrites date params."""
+        def _rewrite(route):
+            url = route.request.url
+            if "GetInventoryCountData" not in url:
+                route.continue_()
+                return
+            new_url = url
+            sd_match = re.search(r"(StartDate=)([^&]*)", new_url)
+            if sd_match:
+                enc = quote_plus(target_start_str)
+                new_url = (
+                    new_url[: sd_match.start(2)]
+                    + enc
+                    + new_url[sd_match.end(2) :]
+                )
+            ed_match = re.search(r"(EndDate=)([^&]*)", new_url)
+            if ed_match:
+                enc = quote_plus(target_end_str)
+                new_url = (
+                    new_url[: ed_match.start(2)]
+                    + enc
+                    + new_url[ed_match.end(2) :]
+                )
+            logger.debug("Rewriting dates in request")
+            route.continue_(url=new_url)
+        return _rewrite
 
     def _get_inventory_count(
         self,
@@ -218,185 +277,115 @@ class YosemiteLodging(BaseProvider):
         year: int,
     ) -> list:
         """
-        Get inventory count by selecting a property from the dropdown
-        and intercepting the GetInventoryCountData API response.
+        Get inventory count for a property and target month.
 
-        Strategy for reliability:
-        1. First attempt uses the existing page (no reload) — avoids
-           burning an extra reCAPTCHA token.
-        2. If the target month is within the widget's natural 3-month
-           window, skip date rewriting entirely (passthrough mode).
-           This keeps the request identical to what a real user would
-           generate, maximising reCAPTCHA acceptance.
-        3. Only rewrite dates when the target month is outside the
-           natural window.
-        4. On failure, reload with exponential backoff so reCAPTCHA
-           Enterprise can reset its risk score.
+        Two-phase strategy for reliability:
+
+        Phase 1 — Passthrough (no date rewriting):
+            Select the property and let the widget fire its natural
+            API call.  If the response already covers the target month,
+            return it immediately.  This path never rewrites the URL,
+            so the request is identical to a real user's, giving the
+            best reCAPTCHA acceptance rate.
+
+        Phase 2 — Date rewrite with retries:
+            If passthrough data doesn't cover the target month (the
+            widget's natural window is prev_month to next_month), reload
+            the page, intercept the request, and rewrite StartDate/EndDate.
+            Retries use exponential backoff (3 s, 6 s, 12 s, 24 s).
         """
         self._ensure_browser()
 
-        max_attempts = 5
         initial_value = (
             f"{YosemiteConfig.YOSEMITE_RECREATION_AREA_ID}:{multiprop_code}"
         )
-        need_rewrite = self._needs_date_rewrite(month, year)
+        target_prefix = f"{year}-{month:02d}"
 
-        # Build rewrite targets only when needed
-        target_start_str = None
-        target_end_str = None
-        if need_rewrite:
-            target_start_str = self._page.evaluate(
-                f"new Date({year}, {month - 1}, 1).toDateString()"
+        # ── Phase 1: Passthrough ──────────────────────────────────
+        self._ensure_dropdown_visible()
+        data, status = self._fetch_once(initial_value)
+        if data is not None:
+            has_target = any(
+                item.get("DateKey", "").startswith(target_prefix)
+                for item in data
             )
-            end_month = month + 2
-            end_year = year
-            if end_month > 12:
-                end_month -= 12
-                end_year += 1
-            _, end_last_day = monthrange(end_year, end_month)
-            target_end_str = self._page.evaluate(
-                f"new Date({end_year}, {end_month - 1}, {end_last_day}).toDateString()"
-            )
+            if has_target:
+                logger.debug(
+                    "Passthrough hit: %d items covering %s",
+                    len(data),
+                    target_prefix,
+                )
+                return data
             logger.debug(
-                "Date rewrite: %s -> %s (target outside natural window)",
-                target_start_str,
-                target_end_str,
+                "Passthrough data (%d items) doesn't cover %s, "
+                "switching to date rewrite",
+                len(data),
+                target_prefix,
             )
         else:
             logger.debug(
-                "Passthrough mode for %s/%s (within natural window)",
-                month,
-                year,
+                "Passthrough returned %d, switching to date rewrite",
+                status,
             )
 
-        for attempt in range(1, max_attempts + 1):
-            # First attempt: reuse existing page when the dropdown is
-            # still visible.  After a previous property selection the
-            # widget hides the dropdown, so we must reload to reset it.
-            # Retries always reload with exponential backoff.
-            need_reload = attempt > 1
-            if attempt == 1:
-                dropdown = self._page.query_selector(
-                    "#box-widget_InitialProductSelection"
+        # ── Phase 2: Date rewrite with retries ────────────────────
+        target_start_str = self._page.evaluate(
+            f"new Date({year}, {month - 1}, 1).toDateString()"
+        )
+        end_month = month + 2
+        end_year = year
+        if end_month > 12:
+            end_month -= 12
+            end_year += 1
+        _, end_last_day = monthrange(end_year, end_month)
+        target_end_str = self._page.evaluate(
+            f"new Date({end_year}, {end_month - 1}, {end_last_day}).toDateString()"
+        )
+        logger.debug(
+            "Date rewrite target: %s -> %s", target_start_str, target_end_str
+        )
+        rewrite_fn = self._make_rewrite_fn(target_start_str, target_end_str)
+
+        max_rewrite_attempts = 4
+        for attempt in range(1, max_rewrite_attempts + 1):
+            # Always reload for a fresh reCAPTCHA token
+            if attempt > 1:
+                backoff = 3 * (2 ** (attempt - 2))  # 3, 6, 12s
+                logger.debug(
+                    "Waiting %ds before rewrite retry %d/%d...",
+                    backoff,
+                    attempt,
+                    max_rewrite_attempts,
                 )
-                if dropdown is None or not dropdown.is_visible():
-                    need_reload = True
-                    logger.debug(
-                        "Dropdown hidden (previous selection), reloading"
-                    )
+                time.sleep(backoff)
 
-            if need_reload:
-                if attempt > 1:
-                    backoff = 3 * (2 ** (attempt - 2))  # 3, 6, 12, 24s
-                    logger.debug(
-                        "Waiting %ds before retry (attempt %d/%d)...",
-                        backoff,
-                        attempt,
-                        max_attempts,
-                    )
-                    time.sleep(backoff)
-                self._page.goto(
-                    YosemiteConfig.SEARCH_PAGE_URL,
-                    wait_until="networkidle",
+            self._page.goto(
+                YosemiteConfig.SEARCH_PAGE_URL,
+                wait_until="networkidle",
+            )
+            self._page.wait_for_selector(
+                "#box-widget_InitialProductSelection", timeout=30000
+            )
+            self._page.wait_for_timeout(2000)
+
+            data, status = self._fetch_once(
+                initial_value, rewrite_dates_fn=rewrite_fn
+            )
+            if data is not None:
+                logger.debug(
+                    "Rewrite hit: %d items for %d/%d",
+                    len(data),
+                    month,
+                    year,
                 )
-                self._page.wait_for_selector(
-                    "#box-widget_InitialProductSelection", timeout=30000
-                )
-                # Extra wait for reCAPTCHA Enterprise to initialise
-                self._page.wait_for_timeout(2000)
+                return data
 
-            try:
-                if need_rewrite:
-                    def _rewrite_dates(route):
-                        url = route.request.url
-                        if "GetInventoryCountData" not in url:
-                            route.continue_()
-                            return
-                        new_url = url
-                        sd_match = re.search(
-                            r"(StartDate=)([^&]*)", new_url
-                        )
-                        if sd_match:
-                            enc_start = quote_plus(target_start_str)
-                            new_url = (
-                                new_url[: sd_match.start(2)]
-                                + enc_start
-                                + new_url[sd_match.end(2) :]
-                            )
-                        ed_match = re.search(
-                            r"(EndDate=)([^&]*)", new_url
-                        )
-                        if ed_match:
-                            enc_end = quote_plus(target_end_str)
-                            new_url = (
-                                new_url[: ed_match.start(2)]
-                                + enc_end
-                                + new_url[ed_match.end(2) :]
-                            )
-                        logger.debug("Rewriting dates in request")
-                        route.continue_(url=new_url)
-
-                    self._page.route("**/*", _rewrite_dates)
-
-                with self._page.expect_response(
-                    lambda r: "GetInventoryCountData" in r.url,
-                    timeout=30000,
-                ) as resp_info:
-                    self._select_property(initial_value)
-
-                if need_rewrite:
-                    self._page.unroute("**/*")
-
-                resp = resp_info.value
-
-                if resp.status == 200:
-                    text = resp.text()
-                    data = self._parse_jsonp(text)
-                    if isinstance(data, list):
-                        logger.debug(
-                            "Got %d inventory items for %d/%d",
-                            len(data),
-                            month,
-                            year,
-                        )
-                    return data
-                else:
-                    # Log response body for diagnostics
-                    body_preview = ""
-                    try:
-                        body_preview = resp.text()[:200]
-                    except Exception:
-                        pass
-                    logger.warning(
-                        "API returned %d (attempt %d/%d)%s",
-                        resp.status,
-                        attempt,
-                        max_attempts,
-                        f": {body_preview}" if body_preview else "",
-                    )
-
-            except Exception as e:
-                if attempt < max_attempts:
-                    logger.info(
-                        "Attempt %d/%d failed (%s), retrying...",
-                        attempt,
-                        max_attempts,
-                        e,
-                    )
-                else:
-                    logger.warning(
-                        "All %d attempts failed for %s %d/%d: %s",
-                        max_attempts,
-                        multiprop_code,
-                        month,
-                        year,
-                        e,
-                    )
-            finally:
-                try:
-                    self._page.unroute("**/*")
-                except Exception:
-                    pass
+            logger.warning(
+                "API returned %d (rewrite attempt %d/%d)",
+                status,
+                attempt,
+                max_rewrite_attempts,
+            )
 
         # All attempts exhausted
         return []
