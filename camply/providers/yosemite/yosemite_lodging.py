@@ -506,7 +506,11 @@ class YosemiteLodging(BaseProvider):
             if property_codes is None or code in property_codes
         }
 
-        for prop_code, prop_name in properties.items():
+        prop_list = list(properties.items())
+        for idx, (prop_code, prop_name) in enumerate(prop_list):
+            # Brief pause between properties to reduce reCAPTCHA rate-limiting
+            if idx > 0:
+                time.sleep(2)
             logger.info(
                 f"Searching Yosemite Lodging Availability: "
                 f"{prop_name} - {month.strftime('%B, %Y')}"
