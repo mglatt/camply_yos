@@ -142,16 +142,7 @@ class YosemiteLodging(BaseProvider):
                     logger.debug("Could not parse widget config: %s", exc)
 
         self._page.on("response", _capture_config)
-        self._page.goto(YosemiteConfig.SEARCH_PAGE_URL, wait_until="networkidle")
-        # Wait for the visible search widget to be ready
-        self._page.wait_for_selector(
-            "#box-widget_InitialProductSelection", timeout=30000
-        )
-        if self._widget_config is not None:
-            logger.debug("Widget config captured successfully")
-        else:
-            logger.debug("No widget config captured during page load")
-        logger.info("Browser ready - search page loaded.")
+        logger.info("Browser launched.")
         self._browser_ready = True
 
     def _close_browser(self) -> None:
@@ -178,26 +169,118 @@ class YosemiteLodging(BaseProvider):
             return json.loads(match.group(1))
         return json.loads(text)
 
-    def _ensure_dropdown_visible(self) -> None:
+    def _navigate_to_search_page(
+        self, month: int = None, year: int = None
+    ) -> None:
         """
-        Ensure the property dropdown is visible, reloading the page
-        if a previous selection hid it.
+        Navigate to the search page with an arrival-date hint so the
+        widget's natural API call covers the target month.
+
+        Two approaches are tried:
+        1. URL parameter ``?ArrivalDate=M/1/YYYY``
+        2. JavaScript: set datepicker / input values before property selection
         """
-        dropdown = self._page.query_selector(
-            "#box-widget_InitialProductSelection"
-        )
-        if dropdown is None or not dropdown.is_visible():
+        url = YosemiteConfig.SEARCH_PAGE_URL
+        if month is not None and year is not None:
+            url += f"?ArrivalDate={month}/1/{year}"
             logger.debug(
-                "Dropdown hidden (previous selection), reloading"
+                "Navigating with date hint: ArrivalDate=%d/1/%d",
+                month,
+                year,
             )
-            self._page.goto(
-                YosemiteConfig.SEARCH_PAGE_URL,
-                wait_until="networkidle",
+
+        self._page.goto(url, wait_until="networkidle")
+        self._page.wait_for_selector(
+            "#box-widget_InitialProductSelection", timeout=30000
+        )
+
+        # One-time diagnostic: log date-related inputs on the page
+        if not hasattr(self, "_date_inputs_logged"):
+            try:
+                date_inputs = self._page.evaluate(
+                    """(() => {
+                    var results = [];
+                    document.querySelectorAll('input').forEach(function(el) {
+                        var id = el.id || '';
+                        var name = el.name || '';
+                        if (id.toLowerCase().includes('date') ||
+                            name.toLowerCase().includes('date') ||
+                            id.toLowerCase().includes('arrival') ||
+                            name.toLowerCase().includes('arrival')) {
+                            results.push({
+                                id: id, name: name,
+                                type: el.type, value: el.value
+                            });
+                        }
+                    });
+                    return results;
+                })()"""
+                )
+                if date_inputs:
+                    logger.debug(
+                        "Date-related inputs found: %s",
+                        json.dumps(date_inputs),
+                    )
+                else:
+                    logger.debug("No date-related inputs found on page")
+            except Exception:
+                pass
+            self._date_inputs_logged = True
+
+        # Try JavaScript date manipulation
+        if month is not None and year is not None:
+            self._set_arrival_date_js(month, year)
+
+        self._page.wait_for_timeout(2000)
+
+    def _set_arrival_date_js(self, month: int, year: int) -> None:
+        """
+        Try to set the widget's arrival date via JavaScript before
+        property selection so the API call naturally covers the target month.
+        """
+        try:
+            result = self._page.evaluate(
+                f"""(() => {{
+                var dateStr = '{month}/1/{year}';
+                var changed = [];
+
+                // jQuery datepicker
+                try {{
+                    if (typeof jQuery !== 'undefined') {{
+                        var dp = jQuery('#box-widget_ArrivalDate');
+                        if (dp.length) {{
+                            dp.val(dateStr).trigger('change');
+                            try {{
+                                dp.datepicker('setDate',
+                                    new Date({year}, {month - 1}, 1));
+                                changed.push('datepicker');
+                            }} catch(e) {{}}
+                            changed.push('jquery-val');
+                        }}
+                    }}
+                }} catch(e) {{}}
+
+                // Direct input manipulation
+                try {{
+                    var sel = 'input[id*="ArrivalDate"], input[id*="arrivaldate"],'
+                        + ' input[name*="ArrivalDate"], input[name*="arrivaldate"]';
+                    document.querySelectorAll(sel).forEach(function(el) {{
+                        el.value = dateStr;
+                        el.dispatchEvent(new Event('change', {{bubbles: true}}));
+                        el.dispatchEvent(new Event('input', {{bubbles: true}}));
+                        changed.push('input:' + (el.id || el.name));
+                    }});
+                }} catch(e) {{}}
+
+                return changed;
+            }})()"""
             )
-            self._page.wait_for_selector(
-                "#box-widget_InitialProductSelection", timeout=30000
-            )
-            self._page.wait_for_timeout(2000)
+            if result:
+                logger.debug("Date hint applied via: %s", ", ".join(result))
+            else:
+                logger.debug("No date inputs found to set")
+        except Exception as e:
+            logger.debug("JS date hint failed: %s", e)
 
     def _fetch_once(self, initial_value: str, rewrite_dates_fn=None) -> tuple:
         """
@@ -279,20 +362,17 @@ class YosemiteLodging(BaseProvider):
         """
         Get inventory count for a property and target month.
 
-        Two-phase strategy for reliability:
+        Strategy for reliability:
 
-        Phase 1 — Passthrough (no date rewriting):
-            Select the property and let the widget fire its natural
-            API call.  If the response already covers the target month,
-            return it immediately.  This path never rewrites the URL,
-            so the request is identical to a real user's, giving the
-            best reCAPTCHA acceptance rate.
+        Phase 1 — Date-hinted passthrough:
+            Navigate with an arrival-date hint (URL param + JS) so the
+            widget's natural API call covers the target month.  No URL
+            rewriting means the request is identical to a real user's,
+            giving the best reCAPTCHA acceptance rate.
 
-        Phase 2 — Date rewrite with retries:
-            If passthrough data doesn't cover the target month (the
-            widget's natural window is prev_month to next_month), reload
-            the page, intercept the request, and rewrite StartDate/EndDate.
-            Retries use exponential backoff (3 s, 6 s, 12 s, 24 s).
+        Phase 2 — URL rewrite fallback (2 attempts):
+            If passthrough data doesn't cover the target month, reload
+            and intercept the request to rewrite StartDate/EndDate.
         """
         self._ensure_browser()
 
@@ -301,8 +381,8 @@ class YosemiteLodging(BaseProvider):
         )
         target_prefix = f"{year}-{month:02d}"
 
-        # ── Phase 1: Passthrough ──────────────────────────────────
-        self._ensure_dropdown_visible()
+        # ── Phase 1: Date-hinted passthrough ─────────────────────
+        self._navigate_to_search_page(month=month, year=year)
         data, status = self._fetch_once(initial_value)
         if data is not None:
             has_target = any(
@@ -317,18 +397,18 @@ class YosemiteLodging(BaseProvider):
                 )
                 return data
             logger.debug(
-                "Passthrough data (%d items) doesn't cover %s, "
-                "switching to date rewrite",
+                "Passthrough (%d items) doesn't cover %s, "
+                "trying rewrite fallback",
                 len(data),
                 target_prefix,
             )
         else:
             logger.debug(
-                "Passthrough returned %d, switching to date rewrite",
+                "Passthrough returned %d, trying rewrite fallback",
                 status,
             )
 
-        # ── Phase 2: Date rewrite with retries ────────────────────
+        # ── Phase 2: URL rewrite fallback ────────────────────────
         target_start_str = self._page.evaluate(
             f"new Date({year}, {month - 1}, 1).toDateString()"
         )
@@ -342,15 +422,14 @@ class YosemiteLodging(BaseProvider):
             f"new Date({end_year}, {end_month - 1}, {end_last_day}).toDateString()"
         )
         logger.debug(
-            "Date rewrite target: %s -> %s", target_start_str, target_end_str
+            "Rewrite target: %s -> %s", target_start_str, target_end_str
         )
         rewrite_fn = self._make_rewrite_fn(target_start_str, target_end_str)
 
-        max_rewrite_attempts = 4
+        max_rewrite_attempts = 2
         for attempt in range(1, max_rewrite_attempts + 1):
-            # Always reload for a fresh reCAPTCHA token
             if attempt > 1:
-                backoff = 3 * (2 ** (attempt - 2))  # 3, 6, 12s
+                backoff = 3 * (2 ** (attempt - 2))  # 3s
                 logger.debug(
                     "Waiting %ds before rewrite retry %d/%d...",
                     backoff,
@@ -359,15 +438,7 @@ class YosemiteLodging(BaseProvider):
                 )
                 time.sleep(backoff)
 
-            self._page.goto(
-                YosemiteConfig.SEARCH_PAGE_URL,
-                wait_until="networkidle",
-            )
-            self._page.wait_for_selector(
-                "#box-widget_InitialProductSelection", timeout=30000
-            )
-            self._page.wait_for_timeout(2000)
-
+            self._navigate_to_search_page(month=month, year=year)
             data, status = self._fetch_once(
                 initial_value, rewrite_dates_fn=rewrite_fn
             )
