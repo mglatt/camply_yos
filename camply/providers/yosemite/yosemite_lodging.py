@@ -463,11 +463,32 @@ class YosemiteLodging(BaseProvider):
                 )
                 continue
 
+            # Log the actual date range the API returned
+            if inventory:
+                all_keys = sorted(item.get("DateKey", "") for item in inventory)
+                logger.debug(
+                    "API date range for %s: %s to %s (%d items)",
+                    prop_name,
+                    all_keys[0],
+                    all_keys[-1],
+                    len(inventory),
+                )
+
             available_dates = [
                 item
                 for item in inventory
                 if item.get("AvailableCount", 0) > 0
             ]
+
+            if available_dates:
+                avail_keys = sorted(
+                    item["DateKey"] for item in available_dates
+                )
+                logger.debug(
+                    "Available date range: %s to %s",
+                    avail_keys[0],
+                    avail_keys[-1],
+                )
 
             logger.info(
                 f"\t{logging_utils.get_emoji(available_dates)}\t"
