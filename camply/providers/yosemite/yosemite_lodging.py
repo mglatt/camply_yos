@@ -483,7 +483,20 @@ class YosemiteLodging(BaseProvider):
                     window_dates.append(d)
 
             if not window_dates:
+                logger.debug(
+                    "No dates in target window (%s to %s) for %s",
+                    start_date,
+                    end_date,
+                    prop_name,
+                )
                 continue
+
+            logger.debug(
+                "%d dates in target window for %s (e.g. %s)",
+                len(window_dates),
+                prop_name,
+                ", ".join(d.isoformat() for d in window_dates[:5]),
+            )
 
             booking_url = self._build_booking_url(prop_code)
             for d in window_dates:
