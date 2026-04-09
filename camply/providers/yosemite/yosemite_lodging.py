@@ -270,18 +270,31 @@ class YosemiteLodging(BaseProvider):
             )
 
         for attempt in range(1, max_attempts + 1):
-            # First attempt: reuse existing page (no reload).
-            # Retries: reload with exponential backoff for a fresh
-            # reCAPTCHA token.
-            if attempt > 1:
-                backoff = 3 * (2 ** (attempt - 2))  # 3, 6, 12, 24s
-                logger.debug(
-                    "Waiting %ds before retry (attempt %d/%d)...",
-                    backoff,
-                    attempt,
-                    max_attempts,
+            # First attempt: reuse existing page when the dropdown is
+            # still visible.  After a previous property selection the
+            # widget hides the dropdown, so we must reload to reset it.
+            # Retries always reload with exponential backoff.
+            need_reload = attempt > 1
+            if attempt == 1:
+                dropdown = self._page.query_selector(
+                    "#box-widget_InitialProductSelection"
                 )
-                time.sleep(backoff)
+                if dropdown is None or not dropdown.is_visible():
+                    need_reload = True
+                    logger.debug(
+                        "Dropdown hidden (previous selection), reloading"
+                    )
+
+            if need_reload:
+                if attempt > 1:
+                    backoff = 3 * (2 ** (attempt - 2))  # 3, 6, 12, 24s
+                    logger.debug(
+                        "Waiting %ds before retry (attempt %d/%d)...",
+                        backoff,
+                        attempt,
+                        max_attempts,
+                    )
+                    time.sleep(backoff)
                 self._page.goto(
                     YosemiteConfig.SEARCH_PAGE_URL,
                     wait_until="networkidle",
